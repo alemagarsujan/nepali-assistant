@@ -1,6 +1,6 @@
-import { AssistantIntent, Contact, Reminder } from "../types";
+import { AssistantIntent } from "../types";
 
-const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://your-backend.example.com";
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://nepali-assistant.onrender.com";
 
 // Sends the Nepali transcript plus lightweight context (contact names only —
 // never phone numbers, never medicine history) to the backend, which prompts

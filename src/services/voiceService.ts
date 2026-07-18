@@ -6,7 +6,7 @@ import { Audio } from "expo-av";
 // ever see yourself pasting an API key into this file, stop — put it in the
 // backend's .env instead.
 
-const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://your-backend.example.com";
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://nepali-assistant.onrender.com";
 
 let recording: Audio.Recording | null = null;
 

@@ -1,9 +1,9 @@
 import React, { useState } from "react";
-import { View, Text, TouchableOpacity, StyleSheet, Alert } from "react-native";
+import { Alert, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { strings } from "../i18n/ne";
 import { secureStorage } from "../services/secureStorage";
 
-const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://your-backend.example.com";
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://nepali-assistant.onrender.com";
 
 // Caregiver pairing: generates a short-lived code on the backend, shown once
 // on screen. The caregiver enters it in their own (separate) companion app

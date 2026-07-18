@@ -22,8 +22,13 @@ const express = require("express");
 const multer = require("multer");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const fetch = require("node-fetch");
 const crypto = require("crypto");
+const FormData = require("form-data");
+
+// Node 18+ has `fetch` built in globally — no need to require a package for
+// it. (The old node-fetch@3 package is ESM-only and breaks when loaded with
+// require(), which is what caused the original "fetch is not a function"
+// error.)
 
 const app = express();
 app.use(helmet());
@@ -55,7 +60,7 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
       method: "POST",
       headers: { "api-subscription-key": process.env.SARVAM_API_KEY },
       body: (() => {
-        const form = new (require("form-data"))();
+        const form = new FormData();
         form.append("file", req.file.buffer, { filename: "speech.m4a" });
         form.append("language_code", "ne-NP");
         return form;
@@ -72,7 +77,11 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
   }
 });
 
-// ---- Text to speech ----
+// ---- Text to speech (CAMB.AI) ----
+// CAMB.AI's TTS is a background task: submit text -> get a task_id -> poll
+// until status is SUCCESS -> fetch the resulting audio URL. We wrap that
+// whole cycle here so the app only ever calls this one endpoint and gets
+// back a ready-to-play URL.
 app.post("/api/speak", async (req, res) => {
   try {
     const { text } = req.body;
@@ -80,21 +89,67 @@ app.post("/api/speak", async (req, res) => {
       return res.status(400).json({ error: "invalid_text" });
     }
 
-    // Swap in your chosen TTS provider's real call here. Returning a signed
-    // URL to the generated audio (from provider or your own object storage)
-    // is typical — shown here as a placeholder shape.
-    const ttsRes = await fetch("https://api.elevenlabs.io/v1/text-to-speech/nepali-voice-id", {
+    // CAMB_VOICE_ID and CAMB_LANGUAGE_ID: find these in your CAMB.AI studio
+    // dashboard under "Voices" — pick a Nepali-capable voice, note its
+    // numeric ID, and note the numeric language code shown alongside it.
+    // Put both in backend/.env as CAMB_VOICE_ID and CAMB_LANGUAGE_ID.
+    const submitRes = await fetch("https://client.camb.ai/apis/tts", {
       method: "POST",
       headers: {
-        "xi-api-key": process.env.ELEVENLABS_API_KEY,
         "Content-Type": "application/json",
+        "x-api-key": process.env.CAMB_API_KEY,
       },
-      body: JSON.stringify({ text, model_id: "eleven_multilingual_v2" }),
+      body: JSON.stringify({
+        text,
+        voice_id: Number(process.env.CAMB_VOICE_ID),
+        language: Number(process.env.CAMB_LANGUAGE_ID),
+      }),
     });
 
-    // In production: stream ttsRes.body to your own storage bucket and
-    // return a short-lived signed URL, rather than proxying raw bytes here.
-    const audioUrl = ttsRes.headers.get("x-generated-audio-url") ?? null;
+    if (!submitRes.ok) {
+      const errText = await submitRes.text();
+      console.error("CAMB submit failed:", errText);
+      return res.status(502).json({ error: "tts_submit_failed" });
+    }
+
+    const { task_id } = await submitRes.json();
+
+    // Poll every 1.5s for up to ~20s. Medicine reminder confirmations and
+    // short answers are usually ready in a few seconds; if this often times
+    // out for you, raise maxAttempts.
+    let runId = null;
+    const maxAttempts = 14;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const statusRes = await fetch(`https://client.camb.ai/apis/tts/${task_id}`, {
+        headers: { "x-api-key": process.env.CAMB_API_KEY },
+      });
+      const statusData = await statusRes.json();
+      if (statusData.status === "SUCCESS") {
+        runId = statusData.run_id;
+        break;
+      }
+      if (statusData.status === "ERROR" || statusData.status === "TIMEOUT") {
+        return res.status(502).json({ error: "tts_generation_failed" });
+      }
+      // else still PENDING — loop again
+    }
+
+    if (!runId) {
+      return res.status(504).json({ error: "tts_timed_out" });
+    }
+
+    const resultRes = await fetch(`https://client.camb.ai/apis/tts-results`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.CAMB_API_KEY,
+      },
+      body: JSON.stringify({ run_ids: [runId] }),
+    });
+    const resultData = await resultRes.json();
+    const audioUrl = resultData?.[runId]?.output_url ?? null;
+
     res.json({ audioUrl });
   } catch (err) {
     console.error("speak error:", err);
