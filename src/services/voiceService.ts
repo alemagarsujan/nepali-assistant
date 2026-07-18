@@ -1,4 +1,18 @@
 import { Audio } from "expo-av";
+import * as FileSystem from "expo-file-system";
+
+// Converts raw audio bytes to a base64 string in chunks, avoiding call-stack
+// limits that can happen from spreading very large arrays at once.
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
 
 // SECURITY NOTE: This file never contains an API key. Every network call goes
 // to YOUR_BACKEND_URL, which is your own server (see /backend). Your server
@@ -25,9 +39,6 @@ export const voiceService = {
   },
 
   // Stops recording, uploads to the backend for transcription, returns Nepali text.
-  // Audio is sent over HTTPS and the backend is instructed to discard the file
-  // immediately after transcription (see backend/server.js) unless the user has
-  // opted into "help improve accuracy" data sharing.
   async stopAndTranscribe(): Promise<string> {
     if (!recording) throw new Error("No active recording");
     await recording.stopAndUnloadAsync();
@@ -53,7 +64,9 @@ export const voiceService = {
     return data.transcript as string;
   },
 
-  // Sends Nepali text to the backend for TTS, returns a playable audio URL.
+  // Sends Nepali text to the backend for TTS. The backend now streams back
+  // the actual audio bytes directly (not a URL), so we save them to a
+  // temporary local file and play from there.
   async speak(text: string): Promise<void> {
     const res = await fetch(`${BACKEND_URL}/api/speak`, {
       method: "POST",
@@ -61,9 +74,15 @@ export const voiceService = {
       body: JSON.stringify({ text }),
     });
     if (!res.ok) throw new Error(`TTS failed: ${res.status}`);
-    const { audioUrl } = await res.json();
 
-    const { sound } = await Audio.Sound.createAsync({ uri: audioUrl });
+    const arrayBuffer = await res.arrayBuffer();
+    const base64Audio = arrayBufferToBase64(arrayBuffer);
+    const fileUri = `${FileSystem.cacheDirectory}speech-${Date.now()}.wav`;
+    await FileSystem.writeAsStringAsync(fileUri, base64Audio, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+
+    const { sound } = await Audio.Sound.createAsync({ uri: fileUri });
     await sound.playAsync();
   },
 };

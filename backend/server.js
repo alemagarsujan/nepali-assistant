@@ -1,21 +1,4 @@
 // Sahayogi backend — the only place API keys live.
-//
-// SECURITY CHECKLIST implemented here:
-// 1. Helmet for standard HTTP security headers.
-// 2. Rate limiting per IP, since this app has no user login/auth — a phone
-//    app calling this backend directly is a common abuse target.
-// 3. CORS locked to nothing (mobile apps don't send an Origin header the way
-//    browsers do, so we don't need to allow one — this blocks stray browser
-//    access to the API).
-// 4. Uploaded audio is processed in memory and never written to disk.
-// 5. The LLM is only ever asked to return one of a FIXED set of intents as
-//    JSON — never asked to "do anything" — which both improves reliability
-//    for this audience and closes off prompt-injection-driven surprises.
-// 6. Caregiver pairing codes are short-lived, single-use, and random —
-//    never a shared password.
-//
-// Deploy this on Render, Railway, Fly.io, or your own VPS with HTTPS
-// (all of the above provide free TLS certs automatically).
 
 require("dotenv").config();
 const express = require("express");
@@ -23,12 +6,9 @@ const multer = require("multer");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
-const FormData = require("form-data");
 
-// Node 18+ has `fetch` built in globally — no need to require a package for
-// it. (The old node-fetch@3 package is ESM-only and breaks when loaded with
-// require(), which is what caused the original "fetch is not a function"
-// error.)
+// Node 18+ has fetch, FormData, and Blob built in globally — no packages
+// needed for any of this.
 
 const app = express();
 app.use(helmet());
@@ -39,13 +19,11 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
-    max: 30, // 30 requests/minute/IP is generous for one elderly user's app usage
+    max: 30,
     standardHeaders: true,
   })
 );
 
-// In-memory pairing store for the scaffold. Replace with Redis or a small DB
-// table in production so codes survive a server restart.
 const pairingCodes = new Map();
 
 // ---- Speech to text ----
@@ -53,21 +31,15 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No audio provided" });
 
-    // Example using Sarvam AI's Nepali ASR. Swap for whichever provider you
-    // settle on — the important part is that the key lives in process.env,
-    // never in the mobile app.
+    const sarvamForm = new FormData();
+    sarvamForm.append("file", new Blob([req.file.buffer]), "speech.m4a");
+    sarvamForm.append("language", "ne-IN");
+    sarvamForm.append("model", "saaras:v3");
+
     const sarvamRes = await fetch("https://api.sarvam.ai/speech-to-text", {
       method: "POST",
       headers: { "api-subscription-key": process.env.SARVAM_API_KEY },
-      body: (() => {
-        const form = new FormData();
-        form.append("file", req.file.buffer, { filename: "speech.m4a" });
-        // "language" (not "language_code") is the correct field name, and
-        // Nepali (ne-IN) requires the saaras:v3 model specifically.
-        form.append("language", "ne-IN");
-        form.append("model", "saaras:v3");
-        return form;
-      })(),
+      body: sarvamForm,
     });
 
     if (!sarvamRes.ok) {
@@ -77,8 +49,6 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
     }
 
     const data = await sarvamRes.json();
-    // req.file.buffer is never written to disk and goes out of scope here —
-    // nothing to clean up.
     res.json({ transcript: data.transcript ?? "" });
   } catch (err) {
     console.error("transcribe error:", err);
@@ -87,10 +57,6 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
 });
 
 // ---- Text to speech (CAMB.AI) ----
-// CAMB.AI's TTS is a background task: submit text -> get a task_id -> poll
-// until status is SUCCESS -> fetch the resulting audio URL. We wrap that
-// whole cycle here so the app only ever calls this one endpoint and gets
-// back a ready-to-play URL.
 app.post("/api/speak", async (req, res) => {
   try {
     const { text } = req.body;
@@ -98,10 +64,6 @@ app.post("/api/speak", async (req, res) => {
       return res.status(400).json({ error: "invalid_text" });
     }
 
-    // CAMB_VOICE_ID and CAMB_LANGUAGE_ID: find these in your CAMB.AI studio
-    // dashboard under "Voices" — pick a Nepali-capable voice, note its
-    // numeric ID, and note the numeric language code shown alongside it.
-    // Put both in backend/.env as CAMB_VOICE_ID and CAMB_LANGUAGE_ID.
     const submitRes = await fetch("https://client.camb.ai/apis/tts", {
       method: "POST",
       headers: {
@@ -123,9 +85,6 @@ app.post("/api/speak", async (req, res) => {
 
     const { task_id } = await submitRes.json();
 
-    // Poll every 1.5s for up to ~20s. Medicine reminder confirmations and
-    // short answers are usually ready in a few seconds; if this often times
-    // out for you, raise maxAttempts.
     let runId = null;
     const maxAttempts = 14;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -141,29 +100,25 @@ app.post("/api/speak", async (req, res) => {
       if (statusData.status === "ERROR" || statusData.status === "TIMEOUT") {
         return res.status(502).json({ error: "tts_generation_failed" });
       }
-      // else still PENDING — loop again
     }
 
     if (!runId) {
       return res.status(504).json({ error: "tts_timed_out" });
     }
 
-    const resultRes = await fetch(`https://client.camb.ai/apis/tts-results`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.CAMB_API_KEY,
-      },
-      body: JSON.stringify({ run_ids: [runId] }),
+    const audioRes = await fetch(`https://client.camb.ai/apis/tts-result/${runId}`, {
+      headers: { "x-api-key": process.env.CAMB_API_KEY },
     });
-    const resultData = await resultRes.json();
-    console.log("CAMB result payload:", JSON.stringify(resultData));
-    const audioUrl = resultData?.[runId]?.output_url ?? null;
-    if (!audioUrl) {
-      console.error("CAMB returned no audioUrl for runId", runId, resultData);
+
+    if (!audioRes.ok) {
+      const errText = await audioRes.text();
+      console.error("CAMB audio fetch failed:", errText);
+      return res.status(502).json({ error: "tts_audio_fetch_failed" });
     }
 
-    res.json({ audioUrl });
+    const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
+    res.set("Content-Type", "audio/wav");
+    res.send(audioBuffer);
   } catch (err) {
     console.error("speak error:", err);
     res.status(500).json({ error: "tts_failed" });
