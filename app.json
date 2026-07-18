@@ -1,0 +1,27 @@
+{
+  "expo": {
+    "name": "Sahayogi",
+    "slug": "sahayogi",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "बोलेर कुरा गर्नको लागि माइक्रोफोन चाहिन्छ।",
+        "NSContactsUsageDescription": "फोन गर्नको लागि तपाईंको सम्पर्क सूची चाहिन्छ।"
+      }
+    },
+    "android": {
+      "permissions": [
+        "RECORD_AUDIO",
+        "READ_CONTACTS",
+        "CALL_PHONE",
+        "SCHEDULE_EXACT_ALARM",
+        "POST_NOTIFICATIONS"
+      ],
+      "package": "com.sahayogi.assistant"
+    },
+    "plugins": ["expo-secure-store"]
+  }
+}
