@@ -1,19 +1,12 @@
 import React, { useState } from "react";
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Alert } from "react-native";
+import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { strings } from "../i18n/ne";
-import { voiceService } from "../services/voiceService";
+import { callService } from "../services/callService";
 import { llmService } from "../services/llmService";
 import { reminderService } from "../services/reminderService";
-import { callService } from "../services/callService";
 import { secureStorage } from "../services/secureStorage";
+import { voiceService } from "../services/voiceService";
 import { Reminder } from "../types";
-
-// Design principles for this screen, deliberately:
-// - ONE primary action (the mic button). Everything else is secondary.
-// - Text is large (28pt+) because the target user may have low vision.
-// - Every state change is also spoken aloud, not just shown as text,
-//   because reading may not be reliable for this audience.
-// - No auto-timeouts that silently fail — every error is spoken + retryable.
 
 type State = "idle" | "listening" | "processing" | "speaking";
 
@@ -31,14 +24,19 @@ export default function HomeScreen() {
   }
 
   async function handlePressOut() {
+    console.log("DEBUG: handlePressOut fired");
     setState("processing");
     try {
+      console.log("DEBUG: calling stopAndTranscribe");
       const transcript = await voiceService.stopAndTranscribe();
+      console.log("DEBUG: got transcript:", transcript);
       const contacts = await secureStorage.getContacts();
+      console.log("DEBUG: calling llmService.interpret");
       const intent = await llmService.interpret(
         transcript,
         contacts.map((c) => c.name)
       );
+      console.log("DEBUG: got intent:", JSON.stringify(intent));
 
       switch (intent.type) {
         case "set_reminder": {
@@ -84,9 +82,14 @@ export default function HomeScreen() {
         }
       }
     } catch (err) {
-      console.warn("Assistant error:", err);
+      console.warn("DEBUG: Assistant error message:", err instanceof Error ? err.message : String(err));
+      console.warn("DEBUG: Assistant error full:", err);
       setState("speaking");
-      await voiceService.speak(strings.errors.genericRetry);
+      try {
+        await voiceService.speak(strings.errors.genericRetry);
+      } catch (speakErr) {
+        console.warn("DEBUG: even the error-speech failed:", speakErr);
+      }
     } finally {
       setState("idle");
     }

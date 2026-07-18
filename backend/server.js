@@ -62,10 +62,19 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
       body: (() => {
         const form = new FormData();
         form.append("file", req.file.buffer, { filename: "speech.m4a" });
-        form.append("language_code", "ne-NP");
+        // "language" (not "language_code") is the correct field name, and
+        // Nepali (ne-IN) requires the saaras:v3 model specifically.
+        form.append("language", "ne-IN");
+        form.append("model", "saaras:v3");
         return form;
       })(),
     });
+
+    if (!sarvamRes.ok) {
+      const errText = await sarvamRes.text();
+      console.error("Sarvam transcribe failed:", errText);
+      return res.status(502).json({ error: "transcribe_failed" });
+    }
 
     const data = await sarvamRes.json();
     // req.file.buffer is never written to disk and goes out of scope here —
@@ -148,7 +157,11 @@ app.post("/api/speak", async (req, res) => {
       body: JSON.stringify({ run_ids: [runId] }),
     });
     const resultData = await resultRes.json();
+    console.log("CAMB result payload:", JSON.stringify(resultData));
     const audioUrl = resultData?.[runId]?.output_url ?? null;
+    if (!audioUrl) {
+      console.error("CAMB returned no audioUrl for runId", runId, resultData);
+    }
 
     res.json({ audioUrl });
   } catch (err) {
