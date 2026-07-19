@@ -6,9 +6,9 @@ const multer = require("multer");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
-
-// Node 18+ has fetch, FormData, and Blob built in globally — no packages
-// needed for any of this.
+const { spawn } = require("child_process");
+const ffmpegPath = require("ffmpeg-static");
+const WebSocket = require("ws");
 
 const app = express();
 app.use(helmet());
@@ -26,156 +26,245 @@ app.use(
 
 const pairingCodes = new Map();
 
-// ---- Speech to text ----
-app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
+const GEMINI_MODEL = "gemini-3.1-flash-live-preview";
+const GEMINI_WS_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${process.env.GEMINI_API_KEY}`;
+
+function convertToPcm16k(inputBuffer) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath, ["-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"]);
+    const chunks = [];
+    ff.stdout.on("data", (d) => chunks.push(d));
+    ff.stderr.on("data", () => {});
+    ff.on("close", (code) => {
+      if (code !== 0) return reject(new Error(`ffmpeg exited with code ${code}`));
+      resolve(Buffer.concat(chunks));
+    });
+    ff.on("error", reject);
+    ff.stdin.write(inputBuffer);
+    ff.stdin.end();
+  });
+}
+
+function pcmToWav(pcmBuffer, sampleRate = 24000) {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcmBuffer.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcmBuffer.length, 40);
+  return Buffer.concat([header, pcmBuffer]);
+}
+
+function buildSystemInstruction(knownContactNames) {
+  return [
+    "तपाईं 'सहयोगी' नामक आवाज सहायक हुनुहुन्छ, वृद्ध वा असक्षम प्रयोगकर्ताको लागि बनाइएको।",
+    "सधैं छोटो, सरल, स्पष्ट नेपालीमा बोल्नुहोस् — २-३ वाक्यभन्दा लामो नबनाउनुहोस्।",
+    "यदि प्रयोगकर्ताले औषधि खाने समय राख्न भन्नुभयो भने set_reminder फङ्सन प्रयोग गरेर मौखिक रूपमा पुष्टि गर्नुहोस्।",
+    "यदि प्रयोगकर्ताले कसैलाई फोन गर्न भन्नुभयो भने call_contact फङ्सन प्रयोग गरेर पुष्टि गर्नुहोस्।",
+    `चिनिएका सम्पर्कहरू: ${knownContactNames.length ? knownContactNames.join(", ") : "कुनै छैन"}।`,
+    "अरू सामान्य प्रश्नहरूको लागि फङ्सन प्रयोग नगरी सिधै छोटो जवाफ बोल्नुहोस्।",
+  ].join("\n");
+}
+
+const ASSISTANT_TOOLS = [
+  {
+    functionDeclarations: [
+      {
+        name: "set_reminder",
+        description: "Schedule a daily medicine reminder at a specific time",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            medicineName: { type: "STRING" },
+            hour: { type: "INTEGER", description: "0-23" },
+            minute: { type: "INTEGER", description: "0-59" },
+          },
+          required: ["medicineName", "hour", "minute"],
+        },
+      },
+      {
+        name: "call_contact",
+        description: "Place a phone call to a known contact",
+        parameters: {
+          type: "OBJECT",
+          properties: { contactName: { type: "STRING" } },
+          required: ["contactName"],
+        },
+      },
+    ],
+  },
+];
+
+app.post("/api/assistant", upload.single("audio"), async (req, res) => {
+  let ws;
   try {
     if (!req.file) return res.status(400).json({ error: "No audio provided" });
 
-    const sarvamForm = new FormData();
-    sarvamForm.append("file", new Blob([req.file.buffer]), "speech.m4a");
-    sarvamForm.append("language", "ne-IN");
-    sarvamForm.append("model", "saaras:v3");
+    let knownContactNames = [];
+    try {
+      knownContactNames = JSON.parse(req.body.knownContactNames || "[]");
+    } catch {}
 
-    const sarvamRes = await fetch("https://api.sarvam.ai/speech-to-text", {
-      method: "POST",
-      headers: { "api-subscription-key": process.env.SARVAM_API_KEY },
-      body: sarvamForm,
+    const pcmIn = await convertToPcm16k(req.file.buffer);
+
+    let resultIntent = null;
+    const audioChunks = [];
+    let inputTranscript = "";
+    let outputTranscript = "";
+
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("gemini_timeout")), 20000);
+      ws = new WebSocket(GEMINI_WS_URL);
+
+      ws.on("open", () => {
+        ws.send(
+          JSON.stringify({
+            setup: {
+              model: `models/${GEMINI_MODEL}`,
+              generationConfig: { responseModalities: ["AUDIO"] },
+              systemInstruction: { parts: [{ text: buildSystemInstruction(knownContactNames) }] },
+              tools: ASSISTANT_TOOLS,
+              inputAudioTranscription: {},
+              outputAudioTranscription: {},
+            },
+          })
+        );
+      });
+
+      ws.on("message", (raw) => {
+        let msg;
+        try {
+          msg = JSON.parse(raw.toString());
+        } catch {
+          return;
+        }
+
+        if (msg.setupComplete) {
+          ws.send(
+            JSON.stringify({
+              realtimeInput: {
+                audio: { data: pcmIn.toString("base64"), mimeType: "audio/pcm;rate=16000" },
+                audioStreamEnd: true,
+              },
+            })
+          );
+          return;
+        }
+
+        if (msg.toolCall?.functionCalls?.length) {
+          const call = msg.toolCall.functionCalls[0];
+          resultIntent = { type: call.name, ...call.args };
+          ws.send(
+            JSON.stringify({
+              toolResponse: {
+                functionResponses: [{ id: call.id, name: call.name, response: { result: "ok" } }],
+              },
+            })
+          );
+        }
+
+        if (msg.serverContent?.modelTurn?.parts) {
+          for (const part of msg.serverContent.modelTurn.parts) {
+            if (part.inlineData?.data) audioChunks.push(Buffer.from(part.inlineData.data, "base64"));
+          }
+        }
+
+        if (msg.serverContent?.inputTranscription?.text) {
+          inputTranscript += msg.serverContent.inputTranscription.text;
+        }
+        if (msg.serverContent?.outputTranscription?.text) {
+          outputTranscript += msg.serverContent.outputTranscription.text;
+        }
+
+        if (msg.serverContent?.turnComplete) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+
+      ws.on("error", (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
     });
 
-    if (!sarvamRes.ok) {
-      const errText = await sarvamRes.text();
-      console.error("Sarvam transcribe failed:", errText);
-      return res.status(502).json({ error: "transcribe_failed" });
+    ws.close();
+
+    if (!resultIntent) {
+      resultIntent = outputTranscript
+        ? { type: "ask_question", question: inputTranscript, answer: outputTranscript }
+        : { type: "unclear", transcript: inputTranscript };
     }
 
-    const data = await sarvamRes.json();
-    res.json({ transcript: data.transcript ?? "" });
+    const wavOut = pcmToWav(Buffer.concat(audioChunks), 24000);
+
+    res.json({
+      intent: resultIntent,
+      audioBase64: wavOut.toString("base64"),
+      transcript: inputTranscript,
+    });
   } catch (err) {
-    console.error("transcribe error:", err);
-    res.status(500).json({ error: "transcription_failed" });
+    console.error("assistant error:", err);
+    try {
+      ws?.close();
+    } catch {}
+    res.status(500).json({ error: "assistant_failed" });
   }
 });
 
-// ---- Text to speech (CAMB.AI) ----
 app.post("/api/speak", async (req, res) => {
   try {
     const { text } = req.body;
-    if (!text || typeof text !== "string" || text.length > 1000) {
+    if (!text || typeof text !== "string" || text.length > 500) {
       return res.status(400).json({ error: "invalid_text" });
     }
 
-    const submitRes = await fetch("https://client.camb.ai/apis/tts", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.CAMB_API_KEY,
-      },
-      body: JSON.stringify({
-        text,
-        voice_id: Number(process.env.CAMB_VOICE_ID),
-        language: Number(process.env.CAMB_LANGUAGE_ID),
-      }),
-    });
-
-    if (!submitRes.ok) {
-      const errText = await submitRes.text();
-      console.error("CAMB submit failed:", errText);
-      return res.status(502).json({ error: "tts_submit_failed" });
-    }
-
-    const { task_id } = await submitRes.json();
-
-    let runId = null;
-    const maxAttempts = 14;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      await new Promise((r) => setTimeout(r, 1500));
-      const statusRes = await fetch(`https://client.camb.ai/apis/tts/${task_id}`, {
-        headers: { "x-api-key": process.env.CAMB_API_KEY },
-      });
-      const statusData = await statusRes.json();
-      if (statusData.status === "SUCCESS") {
-        runId = statusData.run_id;
-        break;
+    const ttsRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text }] }],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } },
+          },
+        }),
       }
-      if (statusData.status === "ERROR" || statusData.status === "TIMEOUT") {
-        return res.status(502).json({ error: "tts_generation_failed" });
-      }
+    );
+
+    if (!ttsRes.ok) {
+      const errText = await ttsRes.text();
+      console.error("Gemini TTS failed:", errText);
+      return res.status(502).json({ error: "tts_failed" });
     }
 
-    if (!runId) {
-      return res.status(504).json({ error: "tts_timed_out" });
-    }
+    const data = await ttsRes.json();
+    const base64Pcm = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!base64Pcm) return res.status(502).json({ error: "tts_no_audio" });
 
-    const audioRes = await fetch(`https://client.camb.ai/apis/tts-result/${runId}`, {
-      headers: { "x-api-key": process.env.CAMB_API_KEY },
-    });
-
-    if (!audioRes.ok) {
-      const errText = await audioRes.text();
-      console.error("CAMB audio fetch failed:", errText);
-      return res.status(502).json({ error: "tts_audio_fetch_failed" });
-    }
-
-    const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
+    const wavOut = pcmToWav(Buffer.from(base64Pcm, "base64"), 24000);
     res.set("Content-Type", "audio/wav");
-    res.send(audioBuffer);
+    res.send(wavOut);
   } catch (err) {
     console.error("speak error:", err);
     res.status(500).json({ error: "tts_failed" });
   }
 });
 
-// ---- Intent interpretation via Claude ----
-app.post("/api/interpret", async (req, res) => {
-  try {
-    const { transcript, knownContactNames } = req.body;
-    if (!transcript || typeof transcript !== "string" || transcript.length > 500) {
-      return res.status(400).json({ error: "invalid_transcript" });
-    }
-
-    const systemPrompt = `You interpret spoken Nepali requests from an elderly or disabled user of a voice assistant app. You must respond with ONLY valid JSON matching exactly one of these shapes, nothing else:
-
-{"type":"set_reminder","medicineName":"...","hour":0-23,"minute":0-59}
-{"type":"call_contact","contactName":"..."}
-{"type":"ask_question","question":"...","answer":"<short spoken Nepali answer, 2-3 sentences max>"}
-{"type":"unclear","transcript":"..."}
-
-Known contacts the user might mean: ${JSON.stringify(knownContactNames ?? [])}
-If the request doesn't clearly match set_reminder or call_contact, and it's a general question, use ask_question and answer briefly and simply in Nepali. If genuinely ambiguous, use "unclear".`;
-
-    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 300,
-        system: systemPrompt,
-        messages: [{ role: "user", content: transcript }],
-      }),
-    });
-
-    const data = await claudeRes.json();
-    const text = data.content?.[0]?.text ?? "{}";
-
-    let intent;
-    try {
-      intent = JSON.parse(text.replace(/```json|```/g, "").trim());
-    } catch {
-      intent = { type: "unclear", transcript };
-    }
-
-    res.json(intent);
-  } catch (err) {
-    console.error("interpret error:", err);
-    res.status(500).json({ type: "unclear", transcript: req.body?.transcript ?? "" });
-  }
-});
-
-// ---- Caregiver pairing ----
 app.post("/api/pairing/create", (req, res) => {
   const code = crypto.randomInt(100000, 999999).toString();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
