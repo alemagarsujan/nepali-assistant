@@ -125,7 +125,17 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
     let outputTranscript = "";
 
     await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("gemini_timeout")), 20000);
+      const timeout = setTimeout(() => {
+
+  console.log("❌ Gemini timeout");
+
+  try {
+    ws?.close();
+  } catch {}
+
+  reject(new Error("gemini_timeout"));
+
+}, 60000);
       ws = new WebSocket(GEMINI_WS_URL);
 
       ws.on("open", () => {
@@ -144,6 +154,7 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
       });
 
       ws.on("message", (raw) => {
+        console.log("🔥 Gemini RAW:", raw.toString().slice(0,500));
         let msg;
         try {
           msg = JSON.parse(raw.toString());
@@ -151,7 +162,8 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
           return;
         }
 
-        if (msg.setupComplete) {
+        if (msg.setupComplete !== undefined) {
+          console.log("✅ Gemini setup completed");
           ws.send(
             JSON.stringify({
               realtimeInput: {
@@ -232,7 +244,7 @@ app.post("/api/speak", async (req, res) => {
     }
 
     const ttsRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-preview-tts:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
