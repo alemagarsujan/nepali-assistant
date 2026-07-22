@@ -5,6 +5,7 @@ export interface Reminder {
   minute: number; // 0-59
   daysOfWeek: number[]; // 0 = Sunday ... 6 = Saturday, empty = every day
   createdAt: string;
+  notificationId?: string; // id returned by expo-notifications, used to cancel
 }
 
 export interface Contact {

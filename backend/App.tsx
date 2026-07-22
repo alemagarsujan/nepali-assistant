@@ -1,10 +1,10 @@
 import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import React from "react";
-import ContactsScreen from "./src/screens/ContactsScreen";
-import HomeScreen from "./src/screens/HomeScreen";
-import RemindersScreen from "./src/screens/RemindersScreen";
-import SettingsScreen from "./src/screens/SettingsScreen";
+import ContactsScreen from "../src/screens/ContactsScreen";
+import HomeScreen from "../src/screens/HomeScreen";
+import RemindersScreen from "../src/screens/RemindersScreen";
+import SettingsScreen from "../src/screens/SettingsScreen";
 
 const Stack = createNativeStackNavigator();
 

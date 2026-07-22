@@ -1,7 +1,7 @@
+import { reminderService } from "@/services/reminderService";
 import React, { useEffect, useState } from "react";
-import { View, Text, FlatList, TouchableOpacity, StyleSheet } from "react-native";
+import { FlatList, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { strings } from "../i18n/ne";
-import { reminderService } from "../services/reminderService";
 import { Reminder } from "../types";
 
 // Kept deliberately simple: large rows, big delete button, no nested forms.

@@ -1,17 +1,19 @@
+import { useNavigation } from "@react-navigation/native";
 import React, { useState } from "react";
 import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { strings } from "../i18n/ne";
-import { callService } from "../services/callService";
-import { llmService } from "../services/llmService";
-import { reminderService } from "../services/reminderService";
-import { secureStorage } from "../services/secureStorage";
-import { voiceService } from "../services/voiceService";
-import { Reminder } from "../types";
+import { assistantService } from "@/services/assistantService";
+import { callService } from "@/services/callService";
+import { reminderService } from "@/services/reminderService";
+import { secureStorage } from "@/services/secureStorage";
+import { voiceService } from "@/services/voiceService";
+import { Reminder } from "@/types";
 
 type State = "idle" | "listening" | "processing" | "speaking";
 
 export default function HomeScreen() {
   const [state, setState] = useState<State>("idle");
+  const navigation = useNavigation<any>();
 
   async function handlePressIn() {
     const granted = await voiceService.requestPermission();
@@ -24,19 +26,14 @@ export default function HomeScreen() {
   }
 
   async function handlePressOut() {
-    console.log("DEBUG: handlePressOut fired");
     setState("processing");
     try {
-      console.log("DEBUG: calling stopAndTranscribe");
-      const transcript = await voiceService.stopAndTranscribe();
-      console.log("DEBUG: got transcript:", transcript);
+      const uri = await voiceService.stopRecordingToFile();
       const contacts = await secureStorage.getContacts();
-      console.log("DEBUG: calling llmService.interpret");
-      const intent = await llmService.interpret(
-        transcript,
+      const { intent, audioBase64 } = await assistantService.send(
+        uri,
         contacts.map((c) => c.name)
       );
-      console.log("DEBUG: got intent:", JSON.stringify(intent));
 
       switch (intent.type) {
         case "set_reminder": {
@@ -50,12 +47,7 @@ export default function HomeScreen() {
           };
           await reminderService.scheduleReminder(reminder);
           setState("speaking");
-          await voiceService.speak(
-            strings.reminders.confirmSpoken(
-              intent.medicineName,
-              `${intent.hour}:${String(intent.minute).padStart(2, "0")}`
-            )
-          );
+          await voiceService.playAudioBase64(audioBase64);
           break;
         }
         case "call_contact": {
@@ -66,13 +58,13 @@ export default function HomeScreen() {
             break;
           }
           setState("speaking");
-          await voiceService.speak(strings.contacts.confirmCall(match.name));
+          await voiceService.playAudioBase64(audioBase64);
           await callService.placeCall(match);
           break;
         }
         case "ask_question": {
           setState("speaking");
-          await voiceService.speak(intent.answer);
+          await voiceService.playAudioBase64(audioBase64);
           break;
         }
         case "unclear": {
@@ -82,13 +74,12 @@ export default function HomeScreen() {
         }
       }
     } catch (err) {
-      console.warn("DEBUG: Assistant error message:", err instanceof Error ? err.message : String(err));
-      console.warn("DEBUG: Assistant error full:", err);
+      console.warn("Assistant error:", err instanceof Error ? err.message : String(err));
       setState("speaking");
       try {
         await voiceService.speak(strings.errors.genericRetry);
       } catch (speakErr) {
-        console.warn("DEBUG: even the error-speech failed:", speakErr);
+        console.warn("even the error-speech failed:", speakErr);
       }
     } finally {
       setState("idle");
@@ -117,6 +108,18 @@ export default function HomeScreen() {
         {state === "processing" && strings.home.processing}
         {state === "idle" && strings.home.micButtonLabel}
       </Text>
+
+      <View style={styles.navRow}>
+        <TouchableOpacity style={styles.navButton} onPress={() => navigation.navigate("Contacts")}>
+          <Text style={styles.navButtonText}>📞 {strings.contacts.title}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.navButton} onPress={() => navigation.navigate("Reminders")}>
+          <Text style={styles.navButtonText}>💊 {strings.reminders.title}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.navButton} onPress={() => navigation.navigate("Settings")}>
+          <Text style={styles.navButtonText}>⚙️ {strings.settings.title}</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
@@ -136,4 +139,12 @@ const styles = StyleSheet.create({
   micButtonActive: { backgroundColor: "#C62828" },
   micIcon: { fontSize: 72 },
   statusText: { fontSize: 22, marginTop: 32, color: "#444", textAlign: "center" },
+  navRow: { flexDirection: "row", marginTop: 48, gap: 12 },
+  navButton: {
+    backgroundColor: "#f0f0f0",
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+  },
+  navButtonText: { fontSize: 16, fontWeight: "600", color: "#333" },
 });

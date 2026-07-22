@@ -26,7 +26,7 @@ app.use(
 
 const pairingCodes = new Map();
 
-const GEMINI_MODEL = "gemini-3.1-flash-live-preview";
+const GEMINI_MODEL = "gemini-2.0-flash-live-001";
 const GEMINI_WS_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${process.env.GEMINI_API_KEY}`;
 
 function convertToPcm16k(inputBuffer) {
@@ -123,6 +123,7 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
     const audioChunks = [];
     let inputTranscript = "";
     let outputTranscript = "";
+    let audioSent = false;  
 
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -143,7 +144,16 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
           JSON.stringify({
             setup: {
               model: `models/${GEMINI_MODEL}`,
-              generationConfig: { responseModalities: ["AUDIO"] },
+              generationConfig: {
+  responseModalities: ["AUDIO"],
+  speechConfig: {
+    voiceConfig: {
+      prebuiltVoiceConfig: {
+        voiceName: "Kore"
+      }
+    }
+  }
+},
               systemInstruction: { parts: [{ text: buildSystemInstruction(knownContactNames) }] },
               tools: ASSISTANT_TOOLS,
               inputAudioTranscription: {},
@@ -162,18 +172,24 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
           return;
         }
 
-        if (msg.setupComplete !== undefined) {
-          console.log("✅ Gemini setup completed");
-          ws.send(
-            JSON.stringify({
-              realtimeInput: {
-                audio: { data: pcmIn.toString("base64"), mimeType: "audio/pcm;rate=16000" },
-                audioStreamEnd: true,
-              },
-            })
-          );
-          return;
-        }
+        if ((msg.setupComplete || msg.sessionResumptionUpdate) && !audioSent) {
+audioSent = true;
+  console.log("🎤 Sending PCM bytes:", pcmIn.length);
+
+  ws.send(
+    JSON.stringify({
+      realtimeInput: {
+        audio: {
+          data: pcmIn.toString("base64"),
+          mimeType: "audio/pcm;rate=16000"
+        },
+        audioStreamEnd: true,
+      },
+    })
+  );
+
+  return;
+}
 
         if (msg.toolCall?.functionCalls?.length) {
           const call = msg.toolCall.functionCalls[0];
