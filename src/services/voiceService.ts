@@ -16,6 +16,21 @@ const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://nepali-assis
 
 let recording: Audio.Recording | null = null;
 
+// iOS routes audio to the earpiece (the quiet speaker you hold to your ear
+// for calls) instead of the main loudspeaker whenever the session category
+// is "PlayAndRecord" — which is exactly what allowsRecordingIOS: true sets
+// during startRecording(). If that mode is still active when playback
+// happens, replies come out of the earpiece instead of the speaker. Switch
+// back to a playback-only session before playing anything; startRecording()
+// switches it back to recording mode for the next turn.
+async function ensurePlaybackAudioMode(): Promise<void> {
+  await Audio.setAudioModeAsync({
+    allowsRecordingIOS: false,
+    playsInSilentModeIOS: true,
+    playThroughEarpieceAndroid: false,
+  });
+}
+
 // HIGH_QUALITY records 44.1kHz stereo at 128kbps — tuned for music, not
 // speech, and the backend immediately downsamples everything to 16kHz mono
 // PCM anyway (see convertToPcm16k in server.js). Recording at that same
@@ -60,58 +75,89 @@ export interface StreamingPlayer {
   finish(): Promise<void>;
 }
 
+async function loadSegment(base64Wav: string): Promise<Audio.Sound> {
+  const fileUri = `${FileSystem.cacheDirectory}speech-seg-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2)}.wav`;
+  await FileSystem.writeAsStringAsync(fileUri, base64Wav, { encoding: "base64" });
+  const { sound } = await Audio.Sound.createAsync({ uri: fileUri }, { shouldPlay: false });
+  return sound;
+}
+
 // expo-av's Sound API loads and plays one complete source at a time — there's
 // no "append to a currently-playing stream" primitive. This fakes streaming
-// by playing a queue of small WAV segments back-to-back: as soon as one
-// finishes, the next (if already arrived) starts immediately. Not
-// sample-accurate gapless audio, but close enough to feel live, and it lets
-// playback start on the first segment instead of waiting for the full reply.
+// by playing a queue of small WAV segments back-to-back. Naively loading
+// each segment only after the previous one finishes left an audible gap per
+// segment (file write + decode happening *after* playback should have
+// already continued) — every pause landed mid-sentence. Instead this
+// double-buffers: while one segment plays, the next is written+decoded in
+// the background so it's ready to go the instant the current one ends.
 export function createStreamingPlayer(): StreamingPlayer {
   const queue: string[] = [];
-  let playing = false;
+  let current: Audio.Sound | null = null;
+  let preloaded: Audio.Sound | null = null;
+  let preloading = false;
   let finished = false;
   let onAllDone: (() => void) | null = null;
+  const modeReady = ensurePlaybackAudioMode();
 
   function checkDone() {
-    if (finished && !playing && queue.length === 0) {
+    if (finished && !current && !preloaded && !preloading && queue.length === 0) {
       onAllDone?.();
       onAllDone = null;
     }
   }
 
-  async function playNext() {
-    if (playing) return;
-    const next = queue.shift();
-    if (!next) {
+  async function ensurePreload() {
+    if (preloaded || preloading || queue.length === 0) return;
+    preloading = true;
+    const next = queue.shift()!;
+    try {
+      await modeReady;
+      const sound = await loadSegment(next);
+      preloaded = sound;
+    } catch (err) {
+      console.warn("streaming player: preload failed, skipping", err);
+    } finally {
+      preloading = false;
+    }
+    // If playback ran out and was waiting on this, kick it off now.
+    if (!current) advance();
+    else ensurePreload(); // keep the pipeline full
+  }
+
+  function advance() {
+    if (current) return;
+    if (!preloaded) {
+      ensurePreload();
       checkDone();
       return;
     }
-    playing = true;
-    try {
-      const fileUri = `${FileSystem.cacheDirectory}speech-seg-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2)}.wav`;
-      await FileSystem.writeAsStringAsync(fileUri, next, { encoding: "base64" });
-      const { sound } = await Audio.Sound.createAsync({ uri: fileUri }, { shouldPlay: true });
-      sound.setOnPlaybackStatusUpdate((status) => {
-        if (status.isLoaded && status.didJustFinish) {
-          sound.unloadAsync().catch(() => {});
-          playing = false;
-          playNext();
-        }
-      });
-    } catch (err) {
-      console.warn("streaming player: segment failed, skipping", err);
-      playing = false;
-      playNext();
-    }
+    const sound = preloaded;
+    preloaded = null;
+    current = sound;
+    sound.setOnPlaybackStatusUpdate((status) => {
+      if (status.isLoaded && status.didJustFinish) {
+        sound.unloadAsync().catch(() => {});
+        current = null;
+        advance();
+        checkDone();
+      }
+    });
+    sound.playAsync().catch((err) => {
+      console.warn("streaming player: play failed, skipping", err);
+      current = null;
+      advance();
+    });
+    ensurePreload(); // start getting the next one ready while this plays
   }
 
   return {
     pushChunk(base64Wav: string) {
       if (!base64Wav) return;
       queue.push(base64Wav);
-      playNext();
+      if (!current) advance();
+      else ensurePreload();
     },
     finish() {
       finished = true;
@@ -146,6 +192,7 @@ export const voiceService = {
 
   async playAudioBase64(base64Wav: string): Promise<void> {
     if (!base64Wav) return;
+    await ensurePlaybackAudioMode();
     const fileUri = `${FileSystem.cacheDirectory}speech-${Date.now()}.wav`;
     await FileSystem.writeAsStringAsync(fileUri, base64Wav, { encoding: "base64" });
     const { sound } = await Audio.Sound.createAsync({ uri: fileUri });
@@ -162,6 +209,7 @@ export const voiceService = {
 
     const arrayBuffer = await res.arrayBuffer();
     const base64Audio = arrayBufferToBase64(arrayBuffer);
+    await ensurePlaybackAudioMode();
     const fileUri = `${FileSystem.cacheDirectory}speech-${Date.now()}.wav`;
     await FileSystem.writeAsStringAsync(fileUri, base64Audio, { encoding: "base64" });
 
