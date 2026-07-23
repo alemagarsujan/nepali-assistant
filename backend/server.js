@@ -358,13 +358,14 @@ app.post("/api/pairing/redeem", (req, res) => {
 // to the client in ~500ms segments as Gemini produces them, so playback can
 // start around "time to first audio byte" instead of "time to full reply".
 //
-// Segments are buffered to ~500ms of PCM before being wrapped as a
-// standalone WAV and sent — forwarding every raw Gemini chunk individually
-// (some arrive just milliseconds apart) would mean dozens of tiny audio
-// files for the client to load and play back to back, which is worse, not
-// better. ~500ms is small enough to feel responsive, large enough to avoid
-// that overhead.
-const SEGMENT_BYTES = 24000; // 500ms of 24kHz mono 16-bit PCM (see pcmToWav)
+// Segments are buffered to ~1.5s of PCM before being wrapped as a standalone
+// WAV and sent. This used to be ~500ms, but every segment boundary costs the
+// phone a real native-audio-engine startup delay when it starts playing the
+// next clip — with 500ms segments that happens ~15+ times over one reply,
+// which is frequent enough to sound like constant stuttering. Bigger
+// segments mean far fewer boundaries (a few instead of a dozen+), at the
+// cost of a bit more time before the very first segment is ready.
+const SEGMENT_BYTES = 72000; // 1.5s of 24kHz mono 16-bit PCM (see pcmToWav)
 
 const port = process.env.PORT || 3000;
 const server = app.listen(port, () => console.log(`Sahayogi backend running on port ${port}`));

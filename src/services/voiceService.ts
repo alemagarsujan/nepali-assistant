@@ -84,20 +84,28 @@ async function loadSegment(base64Wav: string): Promise<Audio.Sound> {
   return sound;
 }
 
+// How much earlier (in ms) to start the next segment before the current one
+// actually reaches its end. Starting a new Sound has real native-engine
+// startup latency (allocating a player, priming the audio buffer) — waiting
+// for didJustFinish before calling playAsync() on the next one means that
+// latency shows up as an audible gap at every single segment boundary. By
+// starting the next segment this many ms early, that startup latency
+// overlaps the tail of the current segment instead of landing as silence.
+const SEGMENT_OVERLAP_MS = 150;
+
 // expo-av's Sound API loads and plays one complete source at a time — there's
 // no "append to a currently-playing stream" primitive. This fakes streaming
-// by playing a queue of small WAV segments back-to-back. Naively loading
-// each segment only after the previous one finishes left an audible gap per
-// segment (file write + decode happening *after* playback should have
-// already continued) — every pause landed mid-sentence. Instead this
-// double-buffers: while one segment plays, the next is written+decoded in
-// the background so it's ready to go the instant the current one ends.
+// by playing a queue of WAV segments back-to-back, double-buffered (the next
+// segment is written+decoded in the background while the current one plays)
+// and started slightly before the current one ends (see SEGMENT_OVERLAP_MS)
+// so the transition doesn't depend on perfect zero-latency scheduling.
 export function createStreamingPlayer(): StreamingPlayer {
   const queue: string[] = [];
   let current: Audio.Sound | null = null;
   let preloaded: Audio.Sound | null = null;
   let preloading = false;
   let finished = false;
+  let advancedEarly = false;
   let onAllDone: (() => void) | null = null;
   const modeReady = ensurePlaybackAudioMode();
 
@@ -114,8 +122,7 @@ export function createStreamingPlayer(): StreamingPlayer {
     const next = queue.shift()!;
     try {
       await modeReady;
-      const sound = await loadSegment(next);
-      preloaded = sound;
+      preloaded = await loadSegment(next);
     } catch (err) {
       console.warn("streaming player: preload failed, skipping", err);
     } finally {
@@ -126,6 +133,50 @@ export function createStreamingPlayer(): StreamingPlayer {
     else ensurePreload(); // keep the pipeline full
   }
 
+  function startCurrent() {
+    const sound = preloaded;
+    if (!sound) return;
+    preloaded = null;
+    current = sound;
+    advancedEarly = false;
+
+    sound.setOnPlaybackStatusUpdate((status) => {
+      if (!status.isLoaded) return;
+
+      // Fire the next segment a little before this one truly ends, so its
+      // startup latency overlaps this segment's tail instead of creating a
+      // silent gap. Only does anything once the next segment has actually
+      // finished preloading.
+      if (
+        !advancedEarly &&
+        preloaded &&
+        status.durationMillis != null &&
+        status.positionMillis >= status.durationMillis - SEGMENT_OVERLAP_MS
+      ) {
+        advancedEarly = true;
+        startCurrent(); // promotes `preloaded` to `current`, starts it
+        ensurePreload();
+      }
+
+      if (status.didJustFinish) {
+        sound.unloadAsync().catch(() => {});
+        // If we already moved on early, `current` now points at the next
+        // segment — don't clobber it or double-advance.
+        if (current === sound) {
+          current = null;
+          advance();
+        }
+        checkDone();
+      }
+    });
+
+    sound.playAsync().catch((err) => {
+      console.warn("streaming player: play failed, skipping", err);
+      if (current === sound) current = null;
+      advance();
+    });
+  }
+
   function advance() {
     if (current) return;
     if (!preloaded) {
@@ -133,23 +184,8 @@ export function createStreamingPlayer(): StreamingPlayer {
       checkDone();
       return;
     }
-    const sound = preloaded;
-    preloaded = null;
-    current = sound;
-    sound.setOnPlaybackStatusUpdate((status) => {
-      if (status.isLoaded && status.didJustFinish) {
-        sound.unloadAsync().catch(() => {});
-        current = null;
-        advance();
-        checkDone();
-      }
-    });
-    sound.playAsync().catch((err) => {
-      console.warn("streaming player: play failed, skipping", err);
-      current = null;
-      advance();
-    });
-    ensurePreload(); // start getting the next one ready while this plays
+    startCurrent();
+    ensurePreload(); // start getting the one after that ready too
   }
 
   return {
