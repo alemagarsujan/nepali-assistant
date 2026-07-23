@@ -16,6 +16,39 @@ const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://nepali-assis
 
 let recording: Audio.Recording | null = null;
 
+// HIGH_QUALITY records 44.1kHz stereo at 128kbps — tuned for music, not
+// speech, and the backend immediately downsamples everything to 16kHz mono
+// PCM anyway (see convertToPcm16k in server.js). Recording at that same
+// 16kHz/mono/low-bitrate target directly means a much smaller file with no
+// loss of anything the backend actually uses, which is the single biggest
+// lever on upload time over a mobile connection.
+const SPEECH_RECORDING_OPTIONS: Audio.RecordingOptions = {
+  isMeteringEnabled: true,
+  android: {
+    extension: ".m4a",
+    outputFormat: Audio.AndroidOutputFormat.MPEG_4,
+    audioEncoder: Audio.AndroidAudioEncoder.AAC,
+    sampleRate: 16000,
+    numberOfChannels: 1,
+    bitRate: 48000,
+  },
+  ios: {
+    extension: ".m4a",
+    outputFormat: Audio.IOSOutputFormat.MPEG4AAC,
+    audioQuality: Audio.IOSAudioQuality.MEDIUM,
+    sampleRate: 16000,
+    numberOfChannels: 1,
+    bitRate: 48000,
+    linearPCMBitDepth: 16,
+    linearPCMIsBigEndian: false,
+    linearPCMIsFloat: false,
+  },
+  web: {
+    mimeType: "audio/webm",
+    bitsPerSecond: 48000,
+  },
+};
+
 export const voiceService = {
   async requestPermission(): Promise<boolean> {
     const { status } = await Audio.requestPermissionsAsync();
@@ -24,9 +57,7 @@ export const voiceService = {
 
   async startRecording(): Promise<void> {
     await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
-    const { recording: rec } = await Audio.Recording.createAsync(
-      Audio.RecordingOptionsPresets.HIGH_QUALITY
-    );
+    const { recording: rec } = await Audio.Recording.createAsync(SPEECH_RECORDING_OPTIONS);
     recording = rec;
   },
 

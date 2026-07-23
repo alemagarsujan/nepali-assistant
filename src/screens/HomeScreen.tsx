@@ -27,13 +27,17 @@ export default function HomeScreen() {
 
   async function handlePressOut() {
     setState("processing");
+    const t0 = Date.now();
+    const elapsed = () => `${Date.now() - t0}ms`;
     try {
       const uri = await voiceService.stopRecordingToFile();
+      console.log(`⏱ [client] recording finalized after ${elapsed()}`);
       const contacts = await secureStorage.getContacts();
       const { intent, audioBase64 } = await assistantService.send(
         uri,
         contacts.map((c) => c.name)
       );
+      console.log(`⏱ [client] got intent+audio after ${elapsed()} total (mic release to now)`);
 
       switch (intent.type) {
         case "set_reminder": {
@@ -48,6 +52,7 @@ export default function HomeScreen() {
           await reminderService.scheduleReminder(reminder);
           setState("speaking");
           await voiceService.playAudioBase64(audioBase64);
+          console.log(`⏱ [client] reply audio started playing after ${elapsed()} total`);
           break;
         }
         case "call_contact": {
@@ -59,12 +64,14 @@ export default function HomeScreen() {
           }
           setState("speaking");
           await voiceService.playAudioBase64(audioBase64);
+          console.log(`⏱ [client] reply audio started playing after ${elapsed()} total`);
           await callService.placeCall(match);
           break;
         }
         case "ask_question": {
           setState("speaking");
           await voiceService.playAudioBase64(audioBase64);
+          console.log(`⏱ [client] reply audio started playing after ${elapsed()} total`);
           break;
         }
         case "unclear": {

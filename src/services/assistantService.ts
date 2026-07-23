@@ -23,6 +23,14 @@ export const assistantService = {
     } as unknown as Blob);
     formData.append("knownContactNames", JSON.stringify(knownContactNames));
 
+    // Timing instrumentation: fetch() resolving marks "response headers +
+    // body received" — for our JSON response that's effectively when the
+    // whole thing has arrived. Comparing this to the backend's own
+    // "sending response to client" log tells us how much of the total time
+    // is upload + network vs. the backend's own processing.
+    const t0 = Date.now();
+    console.log(`⏱ [client] uploading recording...`);
+
     // Don't set Content-Type manually here — fetch needs to generate its own
     // multipart boundary from the FormData object. A hardcoded
     // "multipart/form-data" header has no boundary parameter, so multer on
@@ -31,11 +39,14 @@ export const assistantService = {
       method: "POST",
       body: formData,
     });
+    console.log(`⏱ [client] response received after ${Date.now() - t0}ms (status ${res.status})`);
 
     if (!res.ok) {
       return { intent: { type: "unclear", transcript: "" }, audioBase64: "" };
     }
 
-    return (await res.json()) as AssistantResult;
+    const result = (await res.json()) as AssistantResult;
+    console.log(`⏱ [client] response parsed after ${Date.now() - t0}ms total`);
+    return result;
   },
 };
