@@ -161,6 +161,15 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
               tools: ASSISTANT_TOOLS,
               inputAudioTranscription: {},
               outputAudioTranscription: {},
+              // We upload one complete pre-recorded clip per request, not a
+              // live mic stream, so let us mark the turn boundary explicitly
+              // instead of relying on server-side VAD to detect end-of-speech
+              // from trailing silence in the clip (unreliable, and was the
+              // cause of requests hanging until timeout with no response at
+              // all — see https://ai.google.dev/gemini-api/docs/live-guide#disable-automatic-vad).
+              realtimeInputConfig: {
+                automaticActivityDetection: { disabled: true },
+              },
             },
           })
         );
@@ -179,6 +188,10 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
 audioSent = true;
   console.log("🎤 Sending PCM bytes:", pcmIn.length);
 
+  // Automatic VAD is disabled above, so we own the turn boundary: mark
+  // activityStart, send the whole clip, then activityEnd. (audioStreamEnd
+  // is for pausing a live stream and isn't used in this manual-VAD mode.)
+  ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
   ws.send(
     JSON.stringify({
       realtimeInput: {
@@ -186,10 +199,10 @@ audioSent = true;
           data: pcmIn.toString("base64"),
           mimeType: "audio/pcm;rate=16000"
         },
-        audioStreamEnd: true,
       },
     })
   );
+  ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
 
   return;
 }
