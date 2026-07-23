@@ -112,8 +112,11 @@ const ASSISTANT_TOOLS = [
 
 app.post("/api/assistant", upload.single("audio"), async (req, res) => {
   let ws;
+  const t0 = Date.now();
+  const elapsed = () => `${Date.now() - t0}ms`;
   try {
     if (!req.file) return res.status(400).json({ error: "No audio provided" });
+    console.log(`⏱ [${elapsed()}] request received, audio bytes: ${req.file.buffer.length}`);
 
     let knownContactNames = [];
     try {
@@ -121,17 +124,19 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
     } catch {}
 
     const pcmIn = await convertToPcm16k(req.file.buffer);
+    console.log(`⏱ [${elapsed()}] ffmpeg conversion done, pcm bytes: ${pcmIn.length}`);
 
     let resultIntent = null;
     const audioChunks = [];
     let inputTranscript = "";
     let outputTranscript = "";
-    let audioSent = false;  
+    let audioSent = false;
+    let firstAudioChunkAt = null;
 
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
 
-  console.log("❌ Gemini timeout");
+  console.log(`❌ [${elapsed()}] Gemini timeout`);
 
   try {
     ws?.close();
@@ -141,8 +146,10 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
 
 }, 60000);
       ws = new WebSocket(GEMINI_WS_URL);
+      console.log(`⏱ [${elapsed()}] opening Gemini websocket`);
 
       ws.on("open", () => {
+        console.log(`⏱ [${elapsed()}] websocket open, sending setup`);
         ws.send(
           JSON.stringify({
             setup: {
@@ -181,7 +188,7 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
       });
 
       ws.on("message", (raw) => {
-        console.log("🔥 Gemini RAW:", raw.toString().slice(0,500));
+        console.log(`🔥 [${elapsed()}] Gemini RAW:`, raw.toString().slice(0,500));
         let msg;
         try {
           msg = JSON.parse(raw.toString());
@@ -191,7 +198,7 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
 
         if ((msg.setupComplete || msg.sessionResumptionUpdate) && !audioSent) {
 audioSent = true;
-  console.log("🎤 Sending PCM bytes:", pcmIn.length);
+  console.log(`⏱ [${elapsed()}] setupComplete received, sending PCM bytes:`, pcmIn.length);
 
   // Automatic VAD is disabled above, so we own the turn boundary: mark
   // activityStart, send the whole clip, then activityEnd. (audioStreamEnd
@@ -226,7 +233,13 @@ audioSent = true;
 
         if (msg.serverContent?.modelTurn?.parts) {
           for (const part of msg.serverContent.modelTurn.parts) {
-            if (part.inlineData?.data) audioChunks.push(Buffer.from(part.inlineData.data, "base64"));
+            if (part.inlineData?.data) {
+              if (!firstAudioChunkAt) {
+                firstAudioChunkAt = elapsed();
+                console.log(`⏱ [${firstAudioChunkAt}] first audio chunk from Gemini (time-to-first-byte)`);
+              }
+              audioChunks.push(Buffer.from(part.inlineData.data, "base64"));
+            }
           }
         }
 
@@ -238,6 +251,7 @@ audioSent = true;
         }
 
         if (msg.serverContent?.turnComplete) {
+          console.log(`⏱ [${elapsed()}] turnComplete, total audio chunks: ${audioChunks.length}`);
           clearTimeout(timeout);
           resolve();
         }
@@ -258,6 +272,7 @@ audioSent = true;
     }
 
     const wavOut = pcmToWav(Buffer.concat(audioChunks), 24000);
+    console.log(`⏱ [${elapsed()}] sending response to client, wav bytes: ${wavOut.length}`);
 
     res.json({
       intent: resultIntent,
