@@ -132,6 +132,7 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
     let outputTranscript = "";
     let audioSent = false;
     let firstAudioChunkAt = null;
+    let resolved = false;
 
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -250,8 +251,15 @@ audioSent = true;
           outputTranscript += msg.serverContent.outputTranscription.text;
         }
 
-        if (msg.serverContent?.turnComplete) {
-          console.log(`⏱ [${elapsed()}] turnComplete, total audio chunks: ${audioChunks.length}`);
+        // generationComplete fires when Gemini is done producing audio/text
+        // for this turn — turnComplete follows ~2-2.5s later and just adds
+        // end-of-turn bookkeeping (usageMetadata etc.) we don't need. All the
+        // audio chunks and transcription for this turn have already arrived
+        // by generationComplete, so there's no reason to sit and wait for
+        // turnComplete too — that gap was pure dead time on every request.
+        if ((msg.serverContent?.generationComplete || msg.serverContent?.turnComplete) && !resolved) {
+          resolved = true;
+          console.log(`⏱ [${elapsed()}] turn done (${msg.serverContent?.generationComplete ? "generationComplete" : "turnComplete"}), total audio chunks: ${audioChunks.length}`);
           clearTimeout(timeout);
           resolve();
         }
