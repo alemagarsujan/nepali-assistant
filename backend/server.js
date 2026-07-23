@@ -155,7 +155,12 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
         voiceName: "Kore"
       }
     }
-  }
+  },
+  // gemini-2.5-flash-native-audio models have dynamic thinking ON by
+  // default, which spends real time on internal reasoning tokens before
+  // producing any audio — noticeable latency for zero benefit on a task
+  // like "confirm the reminder" or "call this contact". Turn it off.
+  thinkingConfig: { thinkingBudget: 0 },
 },
               systemInstruction: { parts: [{ text: buildSystemInstruction(knownContactNames) }] },
               tools: ASSISTANT_TOOLS,
