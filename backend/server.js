@@ -110,8 +110,162 @@ const ASSISTANT_TOOLS = [
   },
 ];
 
-app.post("/api/assistant", upload.single("audio"), async (req, res) => {
+// Talks to Gemini Live for one turn: uploads the already-16kHz-PCM audio,
+// waits for the reply, and reports back through callbacks as things happen
+// rather than only at the very end. Both the original one-shot HTTP endpoint
+// and the new streaming WebSocket endpoint below share this — the HTTP path
+// just buffers everything the callbacks hand it (identical to the old
+// inline behavior), the WS path forwards it to the client immediately.
+async function runAssistantTurn(rawAudioBuffer, knownContactNames, { onAudioChunk, onIntent, log } = {}) {
+  const logLine = log || (() => {});
   let ws;
+  const t0 = Date.now();
+  const elapsed = () => `${Date.now() - t0}ms`;
+
+  const pcmIn = await convertToPcm16k(rawAudioBuffer);
+  logLine(`⏱ [${elapsed()}] ffmpeg conversion done, pcm bytes: ${pcmIn.length}`);
+
+  let resultIntent = null;
+  let inputTranscript = "";
+  let outputTranscript = "";
+  let audioSent = false;
+  let firstAudioChunkAt = null;
+  let resolved = false;
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      logLine(`❌ [${elapsed()}] Gemini timeout`);
+      try {
+        ws?.close();
+      } catch {}
+      reject(new Error("gemini_timeout"));
+    }, 60000);
+    ws = new WebSocket(GEMINI_WS_URL);
+    logLine(`⏱ [${elapsed()}] opening Gemini websocket`);
+
+    ws.on("open", () => {
+      logLine(`⏱ [${elapsed()}] websocket open, sending setup`);
+      ws.send(
+        JSON.stringify({
+          setup: {
+            model: `models/${GEMINI_MODEL}`,
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
+              },
+              // gemini-2.5-flash-native-audio models have dynamic thinking ON
+              // by default, which spends real time on internal reasoning
+              // tokens before producing any audio — noticeable latency for
+              // zero benefit on a task like "confirm the reminder". Off.
+              thinkingConfig: { thinkingBudget: 0 },
+            },
+            systemInstruction: { parts: [{ text: buildSystemInstruction(knownContactNames) }] },
+            tools: ASSISTANT_TOOLS,
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            // We upload one complete pre-recorded clip per request, not a
+            // live mic stream, so let us mark the turn boundary explicitly
+            // instead of relying on server-side VAD to detect end-of-speech
+            // from trailing silence in the clip (unreliable, and was the
+            // cause of requests hanging until timeout with no response at
+            // all — see https://ai.google.dev/gemini-api/docs/live-guide#disable-automatic-vad).
+            realtimeInputConfig: {
+              automaticActivityDetection: { disabled: true },
+            },
+          },
+        })
+      );
+    });
+
+    ws.on("message", (raw) => {
+      let msg;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      if ((msg.setupComplete || msg.sessionResumptionUpdate) && !audioSent) {
+        audioSent = true;
+        logLine(`⏱ [${elapsed()}] setupComplete received, sending PCM bytes: ${pcmIn.length}`);
+
+        // Automatic VAD is disabled above, so we own the turn boundary: mark
+        // activityStart, send the whole clip, then activityEnd.
+        ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+        ws.send(
+          JSON.stringify({
+            realtimeInput: {
+              audio: { data: pcmIn.toString("base64"), mimeType: "audio/pcm;rate=16000" },
+            },
+          })
+        );
+        ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+        return;
+      }
+
+      if (msg.toolCall?.functionCalls?.length) {
+        const call = msg.toolCall.functionCalls[0];
+        resultIntent = { type: call.name, ...call.args };
+        onIntent?.(resultIntent);
+        ws.send(
+          JSON.stringify({
+            toolResponse: {
+              functionResponses: [{ id: call.id, name: call.name, response: { result: "ok" } }],
+            },
+          })
+        );
+      }
+
+      if (msg.serverContent?.modelTurn?.parts) {
+        for (const part of msg.serverContent.modelTurn.parts) {
+          if (part.inlineData?.data) {
+            if (!firstAudioChunkAt) {
+              firstAudioChunkAt = elapsed();
+              logLine(`⏱ [${firstAudioChunkAt}] first audio chunk from Gemini (time-to-first-byte)`);
+            }
+            onAudioChunk?.(Buffer.from(part.inlineData.data, "base64"));
+          }
+        }
+      }
+
+      if (msg.serverContent?.inputTranscription?.text) {
+        inputTranscript += msg.serverContent.inputTranscription.text;
+      }
+      if (msg.serverContent?.outputTranscription?.text) {
+        outputTranscript += msg.serverContent.outputTranscription.text;
+      }
+
+      // generationComplete fires when Gemini is done producing audio/text
+      // for this turn — turnComplete follows ~2-2.5s later and just adds
+      // end-of-turn bookkeeping (usageMetadata etc.) we don't need.
+      if ((msg.serverContent?.generationComplete || msg.serverContent?.turnComplete) && !resolved) {
+        resolved = true;
+        logLine(`⏱ [${elapsed()}] turn done (${msg.serverContent?.generationComplete ? "generationComplete" : "turnComplete"})`);
+        clearTimeout(timeout);
+        resolve();
+      }
+    });
+
+    ws.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+  });
+
+  ws.close();
+
+  if (!resultIntent) {
+    resultIntent = outputTranscript
+      ? { type: "ask_question", question: inputTranscript, answer: outputTranscript }
+      : { type: "unclear", transcript: inputTranscript };
+    onIntent?.(resultIntent);
+  }
+
+  return { intent: resultIntent, transcript: inputTranscript };
+}
+
+app.post("/api/assistant", upload.single("audio"), async (req, res) => {
   const t0 = Date.now();
   const elapsed = () => `${Date.now() - t0}ms`;
   try {
@@ -123,175 +277,18 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
       knownContactNames = JSON.parse(req.body.knownContactNames || "[]");
     } catch {}
 
-    const pcmIn = await convertToPcm16k(req.file.buffer);
-    console.log(`⏱ [${elapsed()}] ffmpeg conversion done, pcm bytes: ${pcmIn.length}`);
-
-    let resultIntent = null;
     const audioChunks = [];
-    let inputTranscript = "";
-    let outputTranscript = "";
-    let audioSent = false;
-    let firstAudioChunkAt = null;
-    let resolved = false;
-
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-
-  console.log(`❌ [${elapsed()}] Gemini timeout`);
-
-  try {
-    ws?.close();
-  } catch {}
-
-  reject(new Error("gemini_timeout"));
-
-}, 60000);
-      ws = new WebSocket(GEMINI_WS_URL);
-      console.log(`⏱ [${elapsed()}] opening Gemini websocket`);
-
-      ws.on("open", () => {
-        console.log(`⏱ [${elapsed()}] websocket open, sending setup`);
-        ws.send(
-          JSON.stringify({
-            setup: {
-              model: `models/${GEMINI_MODEL}`,
-              generationConfig: {
-  responseModalities: ["AUDIO"],
-  speechConfig: {
-    voiceConfig: {
-      prebuiltVoiceConfig: {
-        voiceName: "Kore"
-      }
-    }
-  },
-  // gemini-2.5-flash-native-audio models have dynamic thinking ON by
-  // default, which spends real time on internal reasoning tokens before
-  // producing any audio — noticeable latency for zero benefit on a task
-  // like "confirm the reminder" or "call this contact". Turn it off.
-  thinkingConfig: { thinkingBudget: 0 },
-},
-              systemInstruction: { parts: [{ text: buildSystemInstruction(knownContactNames) }] },
-              tools: ASSISTANT_TOOLS,
-              inputAudioTranscription: {},
-              outputAudioTranscription: {},
-              // We upload one complete pre-recorded clip per request, not a
-              // live mic stream, so let us mark the turn boundary explicitly
-              // instead of relying on server-side VAD to detect end-of-speech
-              // from trailing silence in the clip (unreliable, and was the
-              // cause of requests hanging until timeout with no response at
-              // all — see https://ai.google.dev/gemini-api/docs/live-guide#disable-automatic-vad).
-              realtimeInputConfig: {
-                automaticActivityDetection: { disabled: true },
-              },
-            },
-          })
-        );
-      });
-
-      ws.on("message", (raw) => {
-        console.log(`🔥 [${elapsed()}] Gemini RAW:`, raw.toString().slice(0,500));
-        let msg;
-        try {
-          msg = JSON.parse(raw.toString());
-        } catch {
-          return;
-        }
-
-        if ((msg.setupComplete || msg.sessionResumptionUpdate) && !audioSent) {
-audioSent = true;
-  console.log(`⏱ [${elapsed()}] setupComplete received, sending PCM bytes:`, pcmIn.length);
-
-  // Automatic VAD is disabled above, so we own the turn boundary: mark
-  // activityStart, send the whole clip, then activityEnd. (audioStreamEnd
-  // is for pausing a live stream and isn't used in this manual-VAD mode.)
-  ws.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
-  ws.send(
-    JSON.stringify({
-      realtimeInput: {
-        audio: {
-          data: pcmIn.toString("base64"),
-          mimeType: "audio/pcm;rate=16000"
-        },
-      },
-    })
-  );
-  ws.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
-
-  return;
-}
-
-        if (msg.toolCall?.functionCalls?.length) {
-          const call = msg.toolCall.functionCalls[0];
-          resultIntent = { type: call.name, ...call.args };
-          ws.send(
-            JSON.stringify({
-              toolResponse: {
-                functionResponses: [{ id: call.id, name: call.name, response: { result: "ok" } }],
-              },
-            })
-          );
-        }
-
-        if (msg.serverContent?.modelTurn?.parts) {
-          for (const part of msg.serverContent.modelTurn.parts) {
-            if (part.inlineData?.data) {
-              if (!firstAudioChunkAt) {
-                firstAudioChunkAt = elapsed();
-                console.log(`⏱ [${firstAudioChunkAt}] first audio chunk from Gemini (time-to-first-byte)`);
-              }
-              audioChunks.push(Buffer.from(part.inlineData.data, "base64"));
-            }
-          }
-        }
-
-        if (msg.serverContent?.inputTranscription?.text) {
-          inputTranscript += msg.serverContent.inputTranscription.text;
-        }
-        if (msg.serverContent?.outputTranscription?.text) {
-          outputTranscript += msg.serverContent.outputTranscription.text;
-        }
-
-        // generationComplete fires when Gemini is done producing audio/text
-        // for this turn — turnComplete follows ~2-2.5s later and just adds
-        // end-of-turn bookkeeping (usageMetadata etc.) we don't need. All the
-        // audio chunks and transcription for this turn have already arrived
-        // by generationComplete, so there's no reason to sit and wait for
-        // turnComplete too — that gap was pure dead time on every request.
-        if ((msg.serverContent?.generationComplete || msg.serverContent?.turnComplete) && !resolved) {
-          resolved = true;
-          console.log(`⏱ [${elapsed()}] turn done (${msg.serverContent?.generationComplete ? "generationComplete" : "turnComplete"}), total audio chunks: ${audioChunks.length}`);
-          clearTimeout(timeout);
-          resolve();
-        }
-      });
-
-      ws.on("error", (err) => {
-        clearTimeout(timeout);
-        reject(err);
-      });
+    const { intent, transcript } = await runAssistantTurn(req.file.buffer, knownContactNames, {
+      onAudioChunk: (chunk) => audioChunks.push(chunk),
+      log: (line) => console.log(line),
     });
-
-    ws.close();
-
-    if (!resultIntent) {
-      resultIntent = outputTranscript
-        ? { type: "ask_question", question: inputTranscript, answer: outputTranscript }
-        : { type: "unclear", transcript: inputTranscript };
-    }
 
     const wavOut = pcmToWav(Buffer.concat(audioChunks), 24000);
     console.log(`⏱ [${elapsed()}] sending response to client, wav bytes: ${wavOut.length}`);
 
-    res.json({
-      intent: resultIntent,
-      audioBase64: wavOut.toString("base64"),
-      transcript: inputTranscript,
-    });
+    res.json({ intent, audioBase64: wavOut.toString("base64"), transcript });
   } catch (err) {
     console.error("assistant error:", err);
-    try {
-      ws?.close();
-    } catch {}
     res.status(500).json({ error: "assistant_failed" });
   }
 });
@@ -354,5 +351,77 @@ app.post("/api/pairing/redeem", (req, res) => {
   res.json({ paired: true });
 });
 
+// Streaming twin of /api/assistant. The HTTP endpoint waits for Gemini's
+// entire spoken reply before sending anything back — fine for correctness,
+// but it means the phone can't start playing audio until the whole thing
+// (several seconds) has been generated AND transferred. Here we push audio
+// to the client in ~500ms segments as Gemini produces them, so playback can
+// start around "time to first audio byte" instead of "time to full reply".
+//
+// Segments are buffered to ~500ms of PCM before being wrapped as a
+// standalone WAV and sent — forwarding every raw Gemini chunk individually
+// (some arrive just milliseconds apart) would mean dozens of tiny audio
+// files for the client to load and play back to back, which is worse, not
+// better. ~500ms is small enough to feel responsive, large enough to avoid
+// that overhead.
+const SEGMENT_BYTES = 24000; // 500ms of 24kHz mono 16-bit PCM (see pcmToWav)
+
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Sahayogi backend running on port ${port}`));
+const server = app.listen(port, () => console.log(`Sahayogi backend running on port ${port}`));
+
+const streamWss = new WebSocket.Server({ server, path: "/ws/assistant" });
+
+streamWss.on("connection", (clientWs) => {
+  const t0 = Date.now();
+  const elapsed = () => `${Date.now() - t0}ms`;
+  const send = (payload) => {
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify(payload));
+  };
+
+  clientWs.on("message", async (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return send({ type: "error", error: "invalid_message" });
+    }
+    if (msg.type !== "assistant_request") return;
+
+    try {
+      const audioBuffer = Buffer.from(msg.audioBase64 || "", "base64");
+      if (!audioBuffer.length) return send({ type: "error", error: "no_audio" });
+      console.log(`⏱ [ws ${elapsed()}] request received, audio bytes: ${audioBuffer.length}`);
+
+      let segmentBuf = [];
+      let segmentBytes = 0;
+      const flushSegment = (isFinal) => {
+        if (!segmentBytes) return;
+        const wavOut = pcmToWav(Buffer.concat(segmentBuf), 24000);
+        console.log(`⏱ [ws ${elapsed()}] sending audio segment, wav bytes: ${wavOut.length}${isFinal ? " (final)" : ""}`);
+        send({ type: "audio_chunk", data: wavOut.toString("base64") });
+        segmentBuf = [];
+        segmentBytes = 0;
+      };
+
+      const { transcript } = await runAssistantTurn(audioBuffer, msg.knownContactNames || [], {
+        log: (line) => console.log(`[ws ${elapsed()}] ${line}`),
+        onIntent: (intent) => {
+          console.log(`⏱ [ws ${elapsed()}] intent ready: ${intent.type}`);
+          send({ type: "intent", intent });
+        },
+        onAudioChunk: (chunk) => {
+          segmentBuf.push(chunk);
+          segmentBytes += chunk.length;
+          if (segmentBytes >= SEGMENT_BYTES) flushSegment(false);
+        },
+      });
+
+      flushSegment(true);
+      console.log(`⏱ [ws ${elapsed()}] done`);
+      send({ type: "done", transcript });
+    } catch (err) {
+      console.error("assistant ws error:", err);
+      send({ type: "error", error: "assistant_failed" });
+    }
+  });
+});

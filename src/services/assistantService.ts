@@ -1,10 +1,22 @@
+import * as FileSystem from "expo-file-system/legacy";
 import { AssistantIntent } from "../types";
 
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://nepali-assistant.onrender.com";
+const WS_BACKEND_URL = BACKEND_URL.replace(/^http/, "ws");
 
 export interface AssistantResult {
   intent: AssistantIntent;
   audioBase64: string; // WAV, ready to hand to voiceService.playAudioBase64
+}
+
+export interface StreamingHandlers {
+  onIntent: (intent: AssistantIntent) => void;
+  // Each call is one standalone, independently-playable WAV segment (~500ms
+  // of audio), base64-encoded — hand these straight to
+  // voiceService.createStreamingPlayer()'s pushChunk as they arrive.
+  onAudioChunk: (base64Wav: string) => void;
+  onDone: () => void;
+  onError: (err: Error) => void;
 }
 
 // Replaces llmService.ts. Where the old flow was three separate calls
@@ -48,5 +60,64 @@ export const assistantService = {
     const result = (await res.json()) as AssistantResult;
     console.log(`⏱ [client] response parsed after ${Date.now() - t0}ms total`);
     return result;
+  },
+
+  // Streaming variant of send(): same request, but the backend pushes the
+  // reply as a sequence of small playable WAV segments over a WebSocket as
+  // Gemini generates them, instead of one big blob after the whole reply is
+  // done. Combined with voiceService.createStreamingPlayer(), this lets
+  // playback start at roughly "time to first audio segment" (a few seconds)
+  // instead of "time to full reply" (several more seconds on top of that).
+  sendStreaming(recordingUri: string, knownContactNames: string[], handlers: StreamingHandlers): void {
+    const t0 = Date.now();
+
+    (async () => {
+      let ws: WebSocket | null = null;
+      try {
+        const audioBase64 = await FileSystem.readAsStringAsync(recordingUri, { encoding: "base64" });
+        console.log(`⏱ [client] recording read as base64 after ${Date.now() - t0}ms`);
+
+        ws = new WebSocket(`${WS_BACKEND_URL}/ws/assistant`);
+
+        ws.onopen = () => {
+          console.log(`⏱ [client] ws open after ${Date.now() - t0}ms, sending request`);
+          ws!.send(JSON.stringify({ type: "assistant_request", audioBase64, knownContactNames }));
+        };
+
+        ws.onmessage = (event) => {
+          let msg: any;
+          try {
+            msg = JSON.parse(event.data as string);
+          } catch {
+            return;
+          }
+          switch (msg.type) {
+            case "intent":
+              handlers.onIntent(msg.intent as AssistantIntent);
+              break;
+            case "audio_chunk":
+              console.log(`⏱ [client] audio segment received after ${Date.now() - t0}ms`);
+              handlers.onAudioChunk(msg.data as string);
+              break;
+            case "done":
+              console.log(`⏱ [client] stream done after ${Date.now() - t0}ms`);
+              handlers.onDone();
+              ws?.close();
+              break;
+            case "error":
+              handlers.onError(new Error(msg.error ?? "assistant_failed"));
+              ws?.close();
+              break;
+          }
+        };
+
+        ws.onerror = () => {
+          handlers.onError(new Error("assistant_ws_error"));
+        };
+      } catch (err) {
+        ws?.close();
+        handlers.onError(err instanceof Error ? err : new Error(String(err)));
+      }
+    })();
   },
 };

@@ -6,7 +6,7 @@ import { assistantService } from "@/services/assistantService";
 import { callService } from "@/services/callService";
 import { reminderService } from "@/services/reminderService";
 import { secureStorage } from "@/services/secureStorage";
-import { voiceService } from "@/services/voiceService";
+import { createStreamingPlayer, voiceService } from "@/services/voiceService";
 import { Reminder } from "@/types";
 
 type State = "idle" | "listening" | "processing" | "speaking";
@@ -29,57 +29,83 @@ export default function HomeScreen() {
     setState("processing");
     const t0 = Date.now();
     const elapsed = () => `${Date.now() - t0}ms`;
+    const player = createStreamingPlayer();
+    // call_contact-with-no-match resolves *before* any audio has streamed
+    // (it comes from a toolCall, which Gemini sends before generating
+    // speech), so we can catch it in time and play the canned "not found"
+    // message instead of whatever Gemini was about to say. suppressChunks
+    // stops those in-flight/late chunks from also being queued.
+    let suppressChunks = false;
+    let hasStartedSpeaking = false;
+
     try {
       const uri = await voiceService.stopRecordingToFile();
       console.log(`⏱ [client] recording finalized after ${elapsed()}`);
       const contacts = await secureStorage.getContacts();
-      const { intent, audioBase64 } = await assistantService.send(
-        uri,
-        contacts.map((c) => c.name)
-      );
-      console.log(`⏱ [client] got intent+audio after ${elapsed()} total (mic release to now)`);
 
-      switch (intent.type) {
-        case "set_reminder": {
-          const reminder: Reminder = {
-            id: `${Date.now()}`,
-            medicineName: intent.medicineName,
-            hour: intent.hour,
-            minute: intent.minute,
-            daysOfWeek: [],
-            createdAt: new Date().toISOString(),
-          };
-          await reminderService.scheduleReminder(reminder);
-          setState("speaking");
-          await voiceService.playAudioBase64(audioBase64);
-          console.log(`⏱ [client] reply audio started playing after ${elapsed()} total`);
-          break;
-        }
-        case "call_contact": {
-          const match = callService.findBestMatch(intent.contactName, contacts);
-          if (!match) {
-            setState("speaking");
-            await voiceService.speak(strings.contacts.noMatch);
-            break;
-          }
-          setState("speaking");
-          await voiceService.playAudioBase64(audioBase64);
-          console.log(`⏱ [client] reply audio started playing after ${elapsed()} total`);
-          await callService.placeCall(match);
-          break;
-        }
-        case "ask_question": {
-          setState("speaking");
-          await voiceService.playAudioBase64(audioBase64);
-          console.log(`⏱ [client] reply audio started playing after ${elapsed()} total`);
-          break;
-        }
-        case "unclear": {
-          setState("speaking");
-          await voiceService.speak(strings.errors.genericRetry);
-          break;
-        }
-      }
+      await new Promise<void>((resolve, reject) => {
+        assistantService.sendStreaming(uri, contacts.map((c) => c.name), {
+          onIntent: (intent) => {
+            console.log(`⏱ [client] intent received after ${elapsed()}: ${intent.type}`);
+            switch (intent.type) {
+              case "set_reminder": {
+                const reminder: Reminder = {
+                  id: `${Date.now()}`,
+                  medicineName: intent.medicineName,
+                  hour: intent.hour,
+                  minute: intent.minute,
+                  daysOfWeek: [],
+                  createdAt: new Date().toISOString(),
+                };
+                reminderService
+                  .scheduleReminder(reminder)
+                  .catch((err) => console.warn("scheduleReminder failed:", err));
+                break;
+              }
+              case "call_contact": {
+                const match = callService.findBestMatch(intent.contactName, contacts);
+                if (!match) {
+                  suppressChunks = true;
+                  setState("speaking");
+                  voiceService.speak(strings.contacts.noMatch).catch(() => {});
+                } else {
+                  callService.placeCall(match).catch((err) => console.warn("placeCall failed:", err));
+                }
+                break;
+              }
+              case "unclear": {
+                // Resolved late (after all audio for the turn already
+                // streamed) — if Gemini never actually said anything, fall
+                // back to the canned retry. If it did say something, don't
+                // talk over it with a second message.
+                if (!hasStartedSpeaking) {
+                  setState("speaking");
+                  voiceService.speak(strings.errors.genericRetry).catch(() => {});
+                }
+                break;
+              }
+              // "ask_question" needs no side effect — the streamed audio is the answer.
+            }
+          },
+          onAudioChunk: (base64Wav) => {
+            if (suppressChunks) return;
+            if (!hasStartedSpeaking) {
+              hasStartedSpeaking = true;
+              setState("speaking");
+              console.log(`⏱ [client] first reply audio segment after ${elapsed()}`);
+            }
+            player.pushChunk(base64Wav);
+          },
+          onDone: () => {
+            console.log(`⏱ [client] stream done after ${elapsed()}`);
+            resolve();
+          },
+          onError: (err) => reject(err),
+        });
+      });
+
+      await player.finish();
+      console.log(`⏱ [client] all reply audio finished playing after ${elapsed()}`);
     } catch (err) {
       console.warn("Assistant error:", err instanceof Error ? err.message : String(err));
       setState("speaking");

@@ -49,6 +49,80 @@ const SPEECH_RECORDING_OPTIONS: Audio.RecordingOptions = {
   },
 };
 
+export interface StreamingPlayer {
+  // Queue a base64-encoded WAV segment for playback. Plays immediately if
+  // nothing else is currently playing, otherwise queues behind what's
+  // already playing/queued.
+  pushChunk(base64Wav: string): void;
+  // Call once the server has said no more chunks are coming. Resolves once
+  // everything already queued has actually finished playing — this is what
+  // the caller should await before considering the reply "done".
+  finish(): Promise<void>;
+}
+
+// expo-av's Sound API loads and plays one complete source at a time — there's
+// no "append to a currently-playing stream" primitive. This fakes streaming
+// by playing a queue of small WAV segments back-to-back: as soon as one
+// finishes, the next (if already arrived) starts immediately. Not
+// sample-accurate gapless audio, but close enough to feel live, and it lets
+// playback start on the first segment instead of waiting for the full reply.
+export function createStreamingPlayer(): StreamingPlayer {
+  const queue: string[] = [];
+  let playing = false;
+  let finished = false;
+  let onAllDone: (() => void) | null = null;
+
+  function checkDone() {
+    if (finished && !playing && queue.length === 0) {
+      onAllDone?.();
+      onAllDone = null;
+    }
+  }
+
+  async function playNext() {
+    if (playing) return;
+    const next = queue.shift();
+    if (!next) {
+      checkDone();
+      return;
+    }
+    playing = true;
+    try {
+      const fileUri = `${FileSystem.cacheDirectory}speech-seg-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}.wav`;
+      await FileSystem.writeAsStringAsync(fileUri, next, { encoding: "base64" });
+      const { sound } = await Audio.Sound.createAsync({ uri: fileUri }, { shouldPlay: true });
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.isLoaded && status.didJustFinish) {
+          sound.unloadAsync().catch(() => {});
+          playing = false;
+          playNext();
+        }
+      });
+    } catch (err) {
+      console.warn("streaming player: segment failed, skipping", err);
+      playing = false;
+      playNext();
+    }
+  }
+
+  return {
+    pushChunk(base64Wav: string) {
+      if (!base64Wav) return;
+      queue.push(base64Wav);
+      playNext();
+    },
+    finish() {
+      finished = true;
+      return new Promise<void>((resolve) => {
+        onAllDone = resolve;
+        checkDone();
+      });
+    },
+  };
+}
+
 export const voiceService = {
   async requestPermission(): Promise<boolean> {
     const { status } = await Audio.requestPermissionsAsync();
