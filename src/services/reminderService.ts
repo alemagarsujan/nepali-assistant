@@ -30,35 +30,63 @@ export const reminderService = {
   async scheduleReminder(reminder: Reminder): Promise<void> {
     const granted = await ensurePermission();
 
-    let notificationId: string | undefined;
+    const notificationIds: string[] = [];
     if (granted) {
-      notificationId = await Notifications.scheduleNotificationAsync({
-        content: {
-          title: strings.reminders.title,
-          body: strings.reminders.alertSpoken(reminder.medicineName),
-          sound: true,
-        },
-        trigger: {
-          type: Notifications.SchedulableTriggerInputTypes.CALENDAR,
-          hour: reminder.hour,
-          minute: reminder.minute,
-          repeats: true,
-        },
-      });
+      const content = {
+        title: strings.reminders.title,
+        body: strings.reminders.alertSpoken(reminder.medicineName),
+        sound: true,
+      };
+
+      if (reminder.daysOfWeek.length === 0) {
+        // No specific days picked — fire every day.
+        notificationIds.push(
+          await Notifications.scheduleNotificationAsync({
+            content,
+            trigger: {
+              type: Notifications.SchedulableTriggerInputTypes.CALENDAR,
+              hour: reminder.hour,
+              minute: reminder.minute,
+              repeats: true,
+            },
+          })
+        );
+      } else {
+        // One weekly-repeating trigger per selected day. Reminder.daysOfWeek
+        // uses JS Date convention (0 = Sunday), expo-notifications' WEEKLY
+        // trigger uses 1 = Sunday, so shift by one.
+        for (const day of reminder.daysOfWeek) {
+          notificationIds.push(
+            await Notifications.scheduleNotificationAsync({
+              content,
+              trigger: {
+                type: Notifications.SchedulableTriggerInputTypes.WEEKLY,
+                weekday: day + 1,
+                hour: reminder.hour,
+                minute: reminder.minute,
+              },
+            })
+          );
+        }
+      }
     }
     // If permission was denied, we still save the reminder so it shows up
     // in the list — better a silent reminder the user can see and re-enable
     // notifications for, than one that silently vanishes.
 
     const current = await secureStorage.getReminders();
-    await secureStorage.setReminders([...current, { ...reminder, notificationId }]);
+    await secureStorage.setReminders([...current, { ...reminder, notificationIds }]);
   },
 
   async cancelReminder(id: string): Promise<void> {
     const current = await secureStorage.getReminders();
     const target = current.find((r) => r.id === id);
-    if (target?.notificationId) {
-      await Notifications.cancelScheduledNotificationAsync(target.notificationId);
+    if (target?.notificationIds?.length) {
+      await Promise.all(
+        target.notificationIds.map((notifId) =>
+          Notifications.cancelScheduledNotificationAsync(notifId)
+        )
+      );
     }
     await secureStorage.setReminders(current.filter((r) => r.id !== id));
   },

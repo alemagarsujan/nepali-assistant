@@ -34,8 +34,17 @@ export default function ContactsScreen() {
         name: c.name ?? "Unknown",
         phoneNumber: c.phoneNumbers![0].number ?? "",
       }));
-    await secureStorage.setContacts(picked);
-    setContacts(picked);
+
+    // Merge into the existing saved list instead of replacing it — this used
+    // to overwrite the curated list outright, silently deleting any contacts
+    // the user/caregiver had added by hand. Dedupe by phone number so
+    // re-importing doesn't create repeats.
+    const existing = await secureStorage.getContacts();
+    const existingNumbers = new Set(existing.map((c) => c.phoneNumber));
+    const merged = [...existing, ...picked.filter((c) => !existingNumbers.has(c.phoneNumber))];
+
+    await secureStorage.setContacts(merged);
+    setContacts(merged);
   }
 
   async function handleCall(contact: Contact) {

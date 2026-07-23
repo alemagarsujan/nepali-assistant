@@ -26,7 +26,10 @@ app.use(
 
 const pairingCodes = new Map();
 
-const GEMINI_MODEL = "gemini-2.0-flash-live-001";
+// gemini-2.0-flash-live-001 was discontinued (June 2026); this is the current
+// Live API model as of this writing. Check https://ai.google.dev/gemini-api/docs/live-guide
+// if this starts failing again — Google renames/rotates these periodically.
+const GEMINI_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 const GEMINI_WS_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${process.env.GEMINI_API_KEY}`;
 
 function convertToPcm16k(inputBuffer) {
@@ -260,7 +263,7 @@ app.post("/api/speak", async (req, res) => {
     }
 
     const ttsRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-preview-tts:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },

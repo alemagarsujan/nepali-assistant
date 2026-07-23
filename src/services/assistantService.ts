@@ -23,10 +23,13 @@ export const assistantService = {
     } as unknown as Blob);
     formData.append("knownContactNames", JSON.stringify(knownContactNames));
 
+    // Don't set Content-Type manually here — fetch needs to generate its own
+    // multipart boundary from the FormData object. A hardcoded
+    // "multipart/form-data" header has no boundary parameter, so multer on
+    // the backend can't parse the body and req.file ends up empty/undefined.
     const res = await fetch(`${BACKEND_URL}/api/assistant`, {
       method: "POST",
       body: formData,
-      headers: { "Content-Type": "multipart/form-data" },
     });
 
     if (!res.ok) {
