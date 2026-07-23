@@ -80,7 +80,15 @@ async function loadSegment(base64Wav: string): Promise<Audio.Sound> {
     .toString(36)
     .slice(2)}.wav`;
   await FileSystem.writeAsStringAsync(fileUri, base64Wav, { encoding: "base64" });
-  const { sound } = await Audio.Sound.createAsync({ uri: fileUri }, { shouldPlay: false });
+  // Default progressUpdateIntervalMillis is 500ms — far too coarse to catch
+  // a ~150ms "about to end" window (SEGMENT_OVERLAP_MS below); the overlap
+  // logic would silently never fire and every transition would fall back to
+  // the plain didJustFinish path, i.e. no actual overlap. 50ms gives the
+  // early-start check enough resolution to actually land inside the window.
+  const { sound } = await Audio.Sound.createAsync(
+    { uri: fileUri },
+    { shouldPlay: false, progressUpdateIntervalMillis: 50 }
+  );
   return sound;
 }
 
