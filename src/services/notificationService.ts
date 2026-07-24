@@ -27,13 +27,19 @@ const OWN_PACKAGE_NAME = "com.sahayogi.assistant";
 let listenerModule: any = undefined;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function getListenerModule(): any {
-  if (!isNotificationListenerAvailable) return null;
+  if (!isNotificationListenerAvailable) {
+    console.log(
+      `🔔 notification listener unavailable: platform=${Platform.OS} executionEnvironment=${Constants.executionEnvironment}`
+    );
+    return null;
+  }
   if (listenerModule !== undefined) return listenerModule;
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     listenerModule = require("expo-android-notification-listener-service").default;
+    console.log(`🔔 notification listener module loaded: ${listenerModule ? "ok" : "null"}`);
   } catch (err) {
-    console.warn("notification listener module unavailable:", err);
+    console.warn("🔔 notification listener module unavailable:", err);
     listenerModule = null;
   }
   return listenerModule;
@@ -84,6 +90,7 @@ function enqueueSpeak(job: () => Promise<void>): void {
 }
 
 async function speakNotification(n: NotificationData): Promise<void> {
+  console.log(`🔔 speaking notification from ${n.appName || n.packageName}: "${n.title}"`);
   const res = await fetch(`${BACKEND_URL}/api/notify-speak`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -217,9 +224,19 @@ let activeSubscription: any = null;
 // is true. Safe to call repeatedly — a second call while already running is
 // a no-op.
 export function startNotificationListener(): void {
-  if (activeSubscription) return;
+  if (activeSubscription) {
+    console.log("🔔 startNotificationListener: already running, skipping");
+    return;
+  }
   const mod = getListenerModule();
-  if (!mod) return;
+  if (!mod) {
+    console.log("🔔 startNotificationListener: no module, aborting");
+    return;
+  }
+  if (!mod.isNotificationPermissionGranted()) {
+    console.log("🔔 startNotificationListener: permission not granted, aborting");
+    return;
+  }
 
   // Empty array = allow every package (confirmed via the module's Kotlin
   // source: allowedPackages.isEmpty() || allowedPackages.contains(...)) —
@@ -228,17 +245,32 @@ export function startNotificationListener(): void {
   mod.setAllowedPackages([]);
 
   activeSubscription = mod.addListener("onNotificationReceived", (n: NotificationData) => {
-    if (!n || n.packageName === OWN_PACKAGE_NAME) return;
-    if (!n.title && !n.text && !n.bigText) return;
-    if (isSensitiveNotification(n)) return;
-    if (isDuplicate(n)) return;
+    console.log(`🔔 notification received: package=${n?.packageName} title="${n?.title}" text="${n?.text}"`);
+    if (!n || n.packageName === OWN_PACKAGE_NAME) {
+      console.log("🔔 skipped: own package");
+      return;
+    }
+    if (!n.title && !n.text && !n.bigText) {
+      console.log("🔔 skipped: empty content");
+      return;
+    }
+    if (isSensitiveNotification(n)) {
+      console.log("🔔 skipped: looks like OTP/financial content");
+      return;
+    }
+    if (isDuplicate(n)) {
+      console.log("🔔 skipped: duplicate within 30s window");
+      return;
+    }
     enqueueSpeak(() => speakNotification(n));
   });
+  console.log("🔔 startNotificationListener: listener attached");
 }
 
 export function stopNotificationListener(): void {
   activeSubscription?.remove();
   activeSubscription = null;
+  console.log("🔔 stopNotificationListener: stopped");
 }
 
 export function isNotificationListenerRunning(): boolean {
