@@ -2,16 +2,17 @@ import { useNavigation } from "@react-navigation/native";
 import React, { useRef, useState } from "react";
 import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { strings } from "../i18n/ne";
-import { assistantService, LiveConnection, StreamingHandlers } from "@/services/assistantService";
+import { assistantService, LiveConnection, LiveHandlers, StreamingHandlers } from "@/services/assistantService";
 import { callService } from "@/services/callService";
 import { reminderService } from "@/services/reminderService";
 import { secureStorage } from "@/services/secureStorage";
 import {
+  createNativePcmPlayer,
   createStreamingPlayer,
   isNativeMicStreamingAvailable,
   NativeMicStream,
+  NativePcmPlayer,
   startNativeMicStream,
-  StreamingPlayer,
   voiceService,
 } from "@/services/voiceService";
 import { AssistantIntent, Contact, Reminder } from "@/types";
@@ -79,7 +80,7 @@ function makeIntentHandler(contacts: Contact[], flags: TurnFlags, setState: (s: 
 interface LiveSession {
   conn: LiveConnection;
   mic: NativeMicStream;
-  player: StreamingPlayer;
+  player: NativePcmPlayer;
   done: Promise<void>;
 }
 
@@ -115,7 +116,7 @@ export default function HomeScreen() {
       const t0 = Date.now();
       const elapsed = () => `${Date.now() - t0}ms`;
       const contacts = await secureStorage.getContacts();
-      const player = createStreamingPlayer();
+      const player = createNativePcmPlayer();
       const flags: TurnFlags = { suppressChunks: false, hasStartedSpeaking: false };
       const handleIntent = makeIntentHandler(contacts, flags, setState);
 
@@ -126,19 +127,19 @@ export default function HomeScreen() {
         rejectDone = reject;
       });
 
-      const handlers: StreamingHandlers = {
+      const handlers: LiveHandlers = {
         onIntent: (intent) => {
           console.log(`⏱ [client] intent received after ${elapsed()}: ${intent.type}`);
           handleIntent(intent);
         },
-        onAudioChunk: (base64Wav) => {
+        onAudioChunk: (base64Pcm) => {
           if (flags.suppressChunks) return;
           if (!flags.hasStartedSpeaking) {
             flags.hasStartedSpeaking = true;
             setState("speaking");
             console.log(`⏱ [client] first reply audio segment after ${elapsed()}`);
           }
-          player.pushChunk(base64Wav);
+          player.pushChunk(base64Pcm);
         },
         onDone: () => {
           console.log(`⏱ [client] stream done after ${elapsed()}`);

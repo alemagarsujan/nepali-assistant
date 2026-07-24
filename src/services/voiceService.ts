@@ -158,6 +158,72 @@ export async function startNativeMicStream(onChunk: (base64Pcm: string) => void)
   };
 }
 
+function base64ToUint8Array(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+export interface NativePcmPlayer {
+  // Feed one chunk of raw 16kHz mono 16-bit PCM (already downsampled
+  // server-side — see server.js's createDownsampler) straight to the
+  // native audio queue.
+  pushChunk(base64Pcm: string): void;
+  // Call once the server has said no more chunks are coming. Resolves once
+  // the already-queued audio has (approximately) finished playing.
+  finish(): Promise<void>;
+}
+
+// expo-av's Sound API only ever plays one complete file at a time — even
+// with perfect double-buffering (see createStreamingPlayer below), there's
+// always a small native player start-up gap at each segment handoff, which
+// is what was still audible as "a slight pause" even after cutting the
+// reply down to a single handoff. @speechmatics/expo-two-way-audio's
+// playPCMData instead feeds one continuous native audio queue, so chunks
+// play back to back with no per-chunk handoff at all — this is only usable
+// on the native (dev-client/standalone) build, same as startNativeMicStream.
+//
+// One real limitation: the module's player is fixed at 16kHz, so the
+// server downsamples Gemini's 24kHz replies before sending them here —
+// this function just plays whatever PCM bytes it's given, trusting they're
+// already 16kHz.
+export function createNativePcmPlayer(): NativePcmPlayer {
+  const mod = getTwoWayAudio();
+  if (!mod) throw new Error("native PCM playback unavailable");
+
+  let totalBytes = 0;
+  let firstChunkAt: number | null = null;
+
+  return {
+    pushChunk(base64Pcm: string) {
+      if (!base64Pcm) return;
+      const bytes = base64ToUint8Array(base64Pcm);
+      if (!bytes.length) return;
+      totalBytes += bytes.length;
+      if (firstChunkAt === null) firstChunkAt = Date.now();
+      mod.playPCMData(bytes);
+    },
+    finish(): Promise<void> {
+      return new Promise((resolve) => {
+        if (firstChunkAt === null || totalBytes === 0) {
+          resolve();
+          return;
+        }
+        // No "playback finished" event from the module, so this estimates
+        // it from the data itself: 16kHz mono 16-bit PCM is 2 bytes/sample,
+        // 16000 samples/sec. Wait out whatever's left of that duration
+        // beyond what's already elapsed since the first chunk was queued,
+        // plus a small safety margin.
+        const totalDurationMs = (totalBytes / 2 / 16000) * 1000;
+        const elapsedMs = Date.now() - firstChunkAt;
+        const remainingMs = Math.max(0, totalDurationMs - elapsedMs);
+        setTimeout(resolve, remainingMs + 150);
+      });
+    },
+  };
+}
+
 export interface StreamingPlayer {
   // Queue a base64-encoded WAV segment for playback. Plays immediately if
   // nothing else is currently playing, otherwise queues behind what's

@@ -34,6 +34,19 @@ export interface LiveConnection {
   close(): void;
 }
 
+export interface LiveHandlers {
+  onIntent: (intent: AssistantIntent) => void;
+  // Raw 16kHz mono 16-bit PCM, base64-encoded, already downsampled from
+  // Gemini's native 24kHz — hand these straight to
+  // voiceService.createNativePcmPlayer()'s pushChunk. Unlike
+  // StreamingHandlers.onAudioChunk (WAV segments for expo-av), the backend
+  // sends these continuously, as fast as Gemini produces them, since the
+  // native player has no per-segment handoff cost to amortize.
+  onAudioChunk: (base64Pcm: string) => void;
+  onDone: () => void;
+  onError: (err: Error) => void;
+}
+
 // Replaces llmService.ts. Where the old flow was three separate calls
 // (transcribe -> interpret -> speak, each a full round trip), this is one:
 // upload the recording, get back the structured intent AND the spoken
@@ -141,9 +154,10 @@ export const assistantService = {
   // lets the caller push mic chunks as voiceService.startNativeMicStream()
   // produces them. Only usable when voiceService.isNativeMicStreamingAvailable
   // is true — this needs real-time mic access that Expo Go doesn't have.
-  // Reply audio (onAudioChunk) still arrives as WAV segments, same as
-  // sendStreaming() — only the input side is genuinely live here.
-  connectLive(knownContactNames: string[], handlers: StreamingHandlers): LiveConnection {
+  // Reply audio (onAudioChunk) arrives as raw PCM, continuously, meant for
+  // voiceService.createNativePcmPlayer() — not the WAV segments sendStreaming()
+  // produces.
+  connectLive(knownContactNames: string[], handlers: LiveHandlers): LiveConnection {
     const t0 = Date.now();
     const ws = new WebSocket(`${WS_BACKEND_URL}/ws/assistant-live`);
 
@@ -163,8 +177,7 @@ export const assistantService = {
         case "intent":
           handlers.onIntent(msg.intent as AssistantIntent);
           break;
-        case "audio_chunk":
-          console.log(`⏱ [client] live reply segment received after ${Date.now() - t0}ms`);
+        case "audio_chunk_pcm":
           handlers.onAudioChunk(msg.data as string);
           break;
         case "done":

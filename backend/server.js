@@ -463,13 +463,51 @@ streamWss.on("connection", (clientWs) => {
 // releases the button, Gemini has usually already processed most of what
 // they said, instead of not having heard any of it yet.
 //
-// Reply audio still goes out the same way as /ws/assistant — buffered into
-// one short starter WAV segment plus one final segment, not raw per-chunk —
-// because playback on the phone still goes through expo-av either way (see
-// voiceService.ts: the native module is only used for capturing the mic in
-// real time here, not for playback). Only the input side is genuinely live;
-// the reply audio pipeline is untouched on purpose.
+// Reply audio also goes out differently here than on /ws/assistant: instead
+// of a couple of WAV segments played one-at-a-time through expo-av (which
+// always has a small handoff gap between segments — that's the "still a
+// slight pause" residual from the WAV-segment approach), this forwards raw
+// PCM straight to the phone's native two-way-audio module, which plays
+// through one continuous audio queue instead of one-file-at-a-time Sound
+// objects — no per-segment handoff at all. The catch: that module's player
+// is fixed at 16kHz, but Gemini's audio replies are 24kHz, so each reply
+// chunk is downsampled through a small persistent ffmpeg process before
+// being sent on. See voiceService.ts's createNativePcmPlayer().
 const liveWss = new WebSocket.Server({ noServer: true });
+
+// One ffmpeg process per connection, fed 24kHz PCM as it arrives from
+// Gemini and emitting 16kHz PCM as fast as it can, rather than spawning a
+// new process per chunk (which would add real subprocess-startup latency
+// to every single chunk instead of once per turn).
+function createDownsampler(onChunk) {
+  const ff = spawn(ffmpegPath, [
+    "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0",
+    "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
+  ]);
+  ff.stdout.on("data", onChunk);
+  ff.stderr.on("data", () => {});
+  ff.on("error", (err) => console.error("downsampler error:", err));
+  return {
+    write(buf) {
+      if (!ff.stdin.destroyed) ff.stdin.write(buf);
+    },
+    // Resolves once ffmpeg has emitted every last resampled byte — the
+    // caller needs to wait for this before telling the client the turn is
+    // done, otherwise the tail end of the reply could be dropped.
+    finish() {
+      return new Promise((resolve) => {
+        ff.once("close", resolve);
+        if (!ff.stdin.destroyed) ff.stdin.end();
+        else resolve();
+      });
+    },
+    kill() {
+      try {
+        ff.kill("SIGKILL");
+      } catch {}
+    },
+  };
+}
 
 liveWss.on("connection", (clientWs) => {
   const t0 = Date.now();
@@ -489,17 +527,11 @@ liveWss.on("connection", (clientWs) => {
   let resolved = false;
   let timeout = null;
 
-  let segmentBuf = [];
-  let segmentBytes = 0;
-  let firstSegmentSent = false;
-  const flushSegment = (isFinal) => {
-    if (!segmentBytes) return;
-    const wavOut = pcmToWav(Buffer.concat(segmentBuf), 24000);
-    console.log(`⏱ [live ${elapsed()}] sending audio segment, wav bytes: ${wavOut.length}${isFinal ? " (final)" : ""}`);
-    send({ type: "audio_chunk", data: wavOut.toString("base64") });
-    segmentBuf = [];
-    segmentBytes = 0;
-  };
+  let repliedBytes = 0;
+  const downsampler = createDownsampler((pcm16kChunk) => {
+    repliedBytes += pcm16kChunk.length;
+    send({ type: "audio_chunk_pcm", data: pcm16kChunk.toString("base64") });
+  });
 
   function openGemini() {
     console.log(`⏱ [live ${elapsed()}] opening Gemini websocket`);
@@ -510,6 +542,7 @@ liveWss.on("connection", (clientWs) => {
       try {
         geminiWs.close();
       } catch {}
+      downsampler.kill();
       send({ type: "error", error: "assistant_failed" });
     }, 60000);
 
@@ -581,13 +614,9 @@ liveWss.on("connection", (clientWs) => {
       if (msg.serverContent?.modelTurn?.parts) {
         for (const part of msg.serverContent.modelTurn.parts) {
           if (part.inlineData?.data) {
-            const chunk = Buffer.from(part.inlineData.data, "base64");
-            segmentBuf.push(chunk);
-            segmentBytes += chunk.length;
-            if (!firstSegmentSent && segmentBytes >= FIRST_SEGMENT_BYTES) {
-              firstSegmentSent = true;
-              flushSegment(false);
-            }
+            // Straight into the resampler, no buffering — the whole point
+            // is to hand the phone audio as soon as Gemini produces it.
+            downsampler.write(Buffer.from(part.inlineData.data, "base64"));
           }
         }
       }
@@ -602,23 +631,29 @@ liveWss.on("connection", (clientWs) => {
       if ((msg.serverContent?.generationComplete || msg.serverContent?.turnComplete) && !resolved) {
         resolved = true;
         clearTimeout(timeout);
-        console.log(`⏱ [live ${elapsed()}] turn done`);
-        flushSegment(true);
-        if (!resultIntent) {
-          resultIntent = outputTranscript
-            ? { type: "ask_question", question: inputTranscript, answer: outputTranscript }
-            : { type: "unclear", transcript: inputTranscript };
-          send({ type: "intent", intent: resultIntent });
-        }
-        send({ type: "done", transcript: inputTranscript });
+        console.log(`⏱ [live ${elapsed()}] turn done, flushing downsampler`);
         try {
           geminiWs.close();
         } catch {}
+        // Wait for every last resampled byte to actually reach the client
+        // before saying we're done — ffmpeg's stdout keeps emitting for a
+        // moment after stdin closes.
+        downsampler.finish().then(() => {
+          console.log(`⏱ [live ${elapsed()}] downsampler flushed, ${repliedBytes} PCM bytes sent`);
+          if (!resultIntent) {
+            resultIntent = outputTranscript
+              ? { type: "ask_question", question: inputTranscript, answer: outputTranscript }
+              : { type: "unclear", transcript: inputTranscript };
+            send({ type: "intent", intent: resultIntent });
+          }
+          send({ type: "done", transcript: inputTranscript });
+        });
       }
     });
 
     geminiWs.on("error", (err) => {
       clearTimeout(timeout);
+      downsampler.kill();
       console.error("live assistant ws error:", err);
       send({ type: "error", error: "assistant_failed" });
     });
@@ -662,6 +697,7 @@ liveWss.on("connection", (clientWs) => {
 
   clientWs.on("close", () => {
     clearTimeout(timeout);
+    downsampler.kill();
     try {
       geminiWs?.close();
     } catch {}
