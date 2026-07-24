@@ -417,6 +417,29 @@ app.post("/api/notify-speak", async (req, res) => {
   }
 });
 
+// Temporary diagnostic route — this API key/project has had two Gemini
+// model IDs (gemini-2.5-flash, gemini-2.5-flash-lite) both come back 404
+// "no longer available to new users" for plain generateContent calls, even
+// though other model IDs (the Live API model, the TTS model) still work
+// fine for this same key. Rather than guessing more model names one at a
+// time, ask Google directly which models this key can actually call. Safe
+// to delete once notify-speak is working — it doesn't expose the key
+// itself, just which model IDs support generateContent.
+app.get("/api/debug/models", async (req, res) => {
+  try {
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`
+    );
+    const data = await r.json();
+    const names = (data.models || [])
+      .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
+      .map((m) => m.name);
+    res.json({ generateContentModels: names });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 app.post("/api/pairing/create", (req, res) => {
   const code = crypto.randomInt(100000, 999999).toString();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
