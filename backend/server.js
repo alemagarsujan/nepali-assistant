@@ -476,17 +476,24 @@ streamWss.on("connection", (clientWs) => {
 const liveWss = new WebSocket.Server({ noServer: true });
 
 // This app is one person talking to their own assistant, not a multi-user
-// service — so a single module-level "last session" handle is enough to
-// give every new turn memory of previous ones, without the client needing
-// to track or send anything. Each turn is its own WS connection/Gemini
-// session (see openGemini() below), but passing this handle in as
-// sessionResumption.handle tells Gemini "this is a continuation," and it
-// restores the prior audio/text context itself — no need to replay old
-// audio or maintain a transcript ourselves. Handles are valid for 2 hours
-// after the last session ends (per Gemini's docs); if it's stale or this
-// process restarted (Render redeploy), Gemini just starts a fresh session
-// instead of erroring, so this fails safe.
-let lastLiveSessionHandle = null;
+// service — so a single module-level history array is enough to give every
+// new turn memory of previous ones, without the client needing to track or
+// send anything.
+//
+// First attempt at this used Gemini's own session-resumption handles
+// (server hands you a token, you pass it into the next connection's
+// setup and Gemini restores its own prior context). That never actually
+// fired in testing — logs showed no sessionResumptionUpdate message ever
+// arriving within these short few-second turns, even waiting a few
+// seconds past turnComplete for one. Best guess: resumption is built for
+// surviving a dropped connection *during* one long call, sent on its own
+// cadence, not guaranteed per short turn. So instead: replay a plain text
+// transcript of recent turns at the start of each new session via
+// clientContent + historyConfig.initialHistoryInClientContent (see
+// openGemini() and the setupComplete handler below) — fully within our
+// control, not dependent on Gemini's own snapshot timing.
+let conversationHistory = []; // [{ role: "user" | "model", text }]
+const MAX_HISTORY_ENTRIES = 20; // ~10 exchanges — plenty for "what's my name", cheap enough to replay every turn
 
 // One ffmpeg process per connection, fed 24kHz PCM as it arrives from
 // Gemini and emitting 16kHz PCM as fast as it can, rather than spawning a
@@ -546,20 +553,9 @@ liveWss.on("connection", (clientWs) => {
     send({ type: "audio_chunk_pcm", data: pcm16kChunk.toString("base64") });
   });
 
-  let geminiClosed = false;
-  function closeGeminiSoon(afterMs) {
-    setTimeout(() => {
-      if (geminiClosed) return;
-      geminiClosed = true;
-      try {
-        geminiWs.close();
-      } catch {}
-    }, afterMs);
-  }
-
   function openGemini() {
     console.log(
-      `⏱ [live ${elapsed()}] opening Gemini websocket${lastLiveSessionHandle ? " (resuming previous session)" : " (new session)"}`
+      `⏱ [live ${elapsed()}] opening Gemini websocket, ${conversationHistory.length} history entr${conversationHistory.length === 1 ? "y" : "ies"} to replay`
     );
     geminiWs = new WebSocket(GEMINI_WS_URL);
 
@@ -595,10 +591,12 @@ liveWss.on("connection", (clientWs) => {
             realtimeInputConfig: {
               automaticActivityDetection: { disabled: true },
             },
-            // Passing the last handle here (or {} the very first time) is
-            // what gives follow-up questions memory of earlier ones —
-            // Gemini restores the previous turns' audio/text context itself.
-            sessionResumption: lastLiveSessionHandle ? { handle: lastLiveSessionHandle } : {},
+            // Tells Gemini to expect prior conversation turns as
+            // clientContent messages right after setupComplete, ending
+            // with turnComplete: true, before any realtime audio input
+            // starts — see the setupComplete handler below. That replay is
+            // what gives follow-up questions memory of earlier ones.
+            historyConfig: { initialHistoryInClientContent: true },
             // Keeps a long-running back-and-forth from eventually hitting
             // the session's context window limit as history accumulates.
             contextWindowCompression: { slidingWindow: {} },
@@ -615,17 +613,24 @@ liveWss.on("connection", (clientWs) => {
         return;
       }
 
-      // Arrives periodically throughout the session (not just once at
-      // setup) — always take the latest one so the *next* turn resumes
-      // from as close to "now" as possible.
-      if (msg.sessionResumptionUpdate?.resumable && msg.sessionResumptionUpdate?.newHandle) {
-        lastLiveSessionHandle = msg.sessionResumptionUpdate.newHandle;
-        console.log(`⏱ [live ${elapsed()}] session handle updated (memory carried to next turn)`);
-      }
-
       if ((msg.setupComplete || msg.sessionResumptionUpdate) && !setupDone) {
         setupDone = true;
         console.log(`⏱ [live ${elapsed()}] setupComplete, flushing ${pendingChunks.length} buffered chunk(s)`);
+        // With historyConfig.initialHistoryInClientContent set in setup,
+        // Gemini waits for a clientContent message (turnComplete: true)
+        // before it'll accept realtimeInput — send one every time, even
+        // with an empty turns[] on the very first-ever turn, rather than
+        // skip it and risk Gemini waiting indefinitely for a history phase
+        // that never arrives. Non-empty, this is what actually gives the
+        // new session memory of prior turns.
+        geminiWs.send(
+          JSON.stringify({
+            clientContent: {
+              turns: conversationHistory.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
+              turnComplete: true,
+            },
+          })
+        );
         geminiWs.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
         for (const b64 of pendingChunks.splice(0)) {
           geminiWs.send(
@@ -673,15 +678,27 @@ liveWss.on("connection", (clientWs) => {
         resolved = true;
         clearTimeout(timeout);
         console.log(`⏱ [live ${elapsed()}] turn done, flushing downsampler`);
-        // Deliberately NOT closing geminiWs here (that used to be a bug):
-        // we resolve on generationComplete, which fires ~2-2.5s *before*
-        // turnComplete — and turnComplete's end-of-turn bookkeeping is
-        // where the sessionResumptionUpdate carrying THIS turn's content
-        // actually gets sent. Closing immediately meant we always hung up
-        // before that handle ever arrived, so the next turn could never
-        // actually remember anything just said. See closeGeminiSoon below
-        // — the client still gets "done" at the same time as before, this
-        // only changes when we say goodbye to Gemini in the background.
+        try {
+          geminiWs.close();
+        } catch {}
+
+        // This is what actually gives the *next* turn memory of this one —
+        // recorded from the same transcripts already used to build
+        // resultIntent below, replayed at the start of the next session
+        // (see the setupComplete handler above).
+        if (inputTranscript.trim()) {
+          conversationHistory.push({ role: "user", text: inputTranscript.trim() });
+          if (outputTranscript.trim()) {
+            conversationHistory.push({ role: "model", text: outputTranscript.trim() });
+          }
+          if (conversationHistory.length > MAX_HISTORY_ENTRIES) {
+            conversationHistory.splice(0, conversationHistory.length - MAX_HISTORY_ENTRIES);
+          }
+        }
+
+        // Wait for every last resampled byte to actually reach the client
+        // before saying we're done — ffmpeg's stdout keeps emitting for a
+        // moment after stdin closes.
         downsampler.finish().then(() => {
           console.log(`⏱ [live ${elapsed()}] downsampler flushed, ${repliedBytes} PCM bytes sent`);
           if (!resultIntent) {
@@ -692,17 +709,6 @@ liveWss.on("connection", (clientWs) => {
           }
           send({ type: "done", transcript: inputTranscript });
         });
-        // Safety net in case turnComplete (below) never arrives for some
-        // reason — don't hold the connection open forever.
-        closeGeminiSoon(5000);
-      }
-
-      // turnComplete specifically (not just generationComplete) is when the
-      // session-resumption handle for this turn actually gets sent — a
-      // short grace period after it arrives is enough to catch it before
-      // closing.
-      if (msg.serverContent?.turnComplete) {
-        closeGeminiSoon(500);
       }
     });
 
@@ -752,22 +758,10 @@ liveWss.on("connection", (clientWs) => {
 
   clientWs.on("close", () => {
     clearTimeout(timeout);
-    if (resolved && geminiWs) {
-      // The client closes its socket to us right after receiving "done" —
-      // that used to force-close geminiWs immediately too, which defeated
-      // the whole point of the grace period above (this would win the race
-      // against turnComplete every time, before the session-resumption
-      // handle ever arrived). Give it the same short grace period instead.
-      downsampler.kill();
-      closeGeminiSoon(500);
-    } else {
-      // Client disconnected mid-turn (error/force-quit) — nothing useful
-      // left to wait for.
-      downsampler.kill();
-      try {
-        geminiWs?.close();
-      } catch {}
-    }
+    downsampler.kill();
+    try {
+      geminiWs?.close();
+    } catch {}
   });
 });
 
