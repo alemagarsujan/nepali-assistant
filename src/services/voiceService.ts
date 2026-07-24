@@ -93,7 +93,12 @@ function getTwoWayAudio(): any {
 }
 
 let nativeAudioReady: Promise<boolean> | null = null;
-function ensureNativeAudioInitialized(): Promise<boolean> {
+// Exported so notificationService can initialize the native audio module
+// before its first playback attempt — createNativePcmPlayer() itself
+// assumes initialize() has already run, which normally happens as a side
+// effect of the user pressing the mic button first (startNativeMicStream
+// calls this). A notification can arrive before that ever happens.
+export function ensureNativeAudioInitialized(): Promise<boolean> {
   if (nativeAudioReady) return nativeAudioReady;
   nativeAudioReady = (async () => {
     const mod = getTwoWayAudio();

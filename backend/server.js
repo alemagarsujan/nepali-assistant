@@ -48,6 +48,30 @@ function convertToPcm16k(inputBuffer) {
   });
 }
 
+// One-shot version of createDownsampler (below) — same ffmpeg args, but for
+// a single already-complete buffer instead of a live stream. Used to turn
+// Gemini TTS's fixed 24kHz output into the 16kHz raw PCM the native player
+// (@speechmatics/expo-two-way-audio, used by both the live assistant and
+// now notification playback) expects.
+function resamplePcm24to16(pcmBuffer) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath, [
+      "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0",
+      "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
+    ]);
+    const chunks = [];
+    ff.stdout.on("data", (d) => chunks.push(d));
+    ff.stderr.on("data", () => {});
+    ff.on("close", (code) => {
+      if (code !== 0) return reject(new Error(`resample ffmpeg exited with code ${code}`));
+      resolve(Buffer.concat(chunks));
+    });
+    ff.on("error", reject);
+    ff.stdin.write(pcmBuffer);
+    ff.stdin.end();
+  });
+}
+
 function pcmToWav(pcmBuffer, sampleRate = 24000) {
   const numChannels = 1;
   const bitsPerSample = 16;
@@ -312,9 +336,9 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
 });
 
 // Shared by /api/speak and /api/notify-speak — takes Nepali (or any) text,
-// returns a ready-to-play WAV Buffer. Throws on failure; callers decide the
-// HTTP response.
-async function synthesizeSpeech(text) {
+// returns Gemini TTS's raw output: 24kHz mono 16-bit PCM. Throws on
+// failure; callers decide the HTTP response and format.
+async function synthesizeSpeechRawPcm24k(text) {
   const ttsRes = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${process.env.GEMINI_API_KEY}`,
     {
@@ -339,7 +363,13 @@ async function synthesizeSpeech(text) {
   const base64Pcm = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
   if (!base64Pcm) throw new Error("Gemini TTS returned no audio");
 
-  return pcmToWav(Buffer.from(base64Pcm, "base64"), 24000);
+  return Buffer.from(base64Pcm, "base64");
+}
+
+// /api/speak's shape: a ready-to-play WAV Buffer at Gemini's native 24kHz.
+async function synthesizeSpeech(text) {
+  const pcm24k = await synthesizeSpeechRawPcm24k(text);
+  return pcmToWav(pcm24k, 24000);
 }
 
 app.post("/api/speak", async (req, res) => {
@@ -407,10 +437,16 @@ app.post("/api/notify-speak", async (req, res) => {
     const spokenText = composeData.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
     if (!spokenText) return res.status(502).json({ error: "compose_empty" });
 
-    const wavOut = await synthesizeSpeech(spokenText);
-    res.set("Content-Type", "audio/wav");
-    res.set("X-Spoken-Text", encodeURIComponent(spokenText));
-    res.send(wavOut);
+    // Raw 16kHz PCM (not a WAV file) — the client plays this through the
+    // same native audio pipeline (@speechmatics/expo-two-way-audio) the
+    // live assistant already uses, instead of expo-av's separate Audio.Sound
+    // API. The two don't share the same underlying Android audio session,
+    // and running them concurrently was breaking the live assistant
+    // whenever a notification tried to speak — routing both through one
+    // pipeline avoids that entirely.
+    const pcm24k = await synthesizeSpeechRawPcm24k(spokenText);
+    const pcm16k = await resamplePcm24to16(pcm24k);
+    res.json({ spokenText, audioBase64: pcm16k.toString("base64") });
   } catch (err) {
     console.error("notify-speak error:", err);
     res.status(500).json({ error: "notify_speak_failed" });

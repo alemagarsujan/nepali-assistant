@@ -1,8 +1,6 @@
-import { Audio } from "expo-av";
 import Constants, { ExecutionEnvironment } from "expo-constants";
-import * as FileSystem from "expo-file-system/legacy";
 import { Platform } from "react-native";
-import { ensurePlaybackAudioMode } from "./voiceService";
+import { createNativePcmPlayer, ensureNativeAudioInitialized } from "./voiceService";
 
 // Reads phone notifications aloud in Nepali, translating from English (or
 // any language) when needed. Android-only: iOS has no API that lets one app
@@ -91,15 +89,27 @@ function enqueueSpeak(job: () => Promise<void>): void {
 }
 
 // Hard ceiling on how long one notification is allowed to hold up the
-// queue. Without this, a playback status event that never fires (see the
-// race note below) or a stuck native audio session would jam every
-// notification behind it forever — and since this shares the phone's
-// single audio hardware with the live assistant's mic/playback session
-// (@speechmatics/expo-two-way-audio), a stuck expo-av Sound here can also
-// starve the assistant of audio access, which is likely why the main
-// assistant stopped responding after a notification failed to finish.
+// queue, in case something downstream never resolves.
 const PLAYBACK_TIMEOUT_MS = 20_000;
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T | void> {
+  return Promise.race([
+    promise,
+    new Promise<void>((resolve) => setTimeout(() => {
+      console.warn(`🔔 ${label} timed out after ${ms}ms`);
+      resolve();
+    }, ms)),
+  ]);
+}
+
+// Plays through the exact same native audio pipeline
+// (@speechmatics/expo-two-way-audio, via voiceService's createNativePcmPlayer)
+// that the live assistant itself uses for replies — not expo-av's separate
+// Audio.Sound API. Those are two independent audio systems on Android, and
+// running Audio.Sound here at the same time the live assistant was
+// recording/playing through the native module was breaking the assistant
+// entirely (it would stop responding to voice after a notification tried
+// to speak). Routing both through one pipeline removes that conflict.
 async function speakNotification(n: NotificationData): Promise<void> {
   console.log(`🔔 speaking notification from ${n.appName || n.packageName}: "${n.title}"`);
   const res = await fetch(`${BACKEND_URL}/api/notify-speak`, {
@@ -116,59 +126,22 @@ async function speakNotification(n: NotificationData): Promise<void> {
     throw new Error(`notify-speak failed: ${res.status} ${errBody}`);
   }
 
-  const arrayBuffer = await res.arrayBuffer();
-  let binary = "";
-  const bytes = new Uint8Array(arrayBuffer);
-  const chunkSize = 8192;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  const { audioBase64 } = (await res.json()) as { audioBase64: string; spokenText: string };
+  if (!audioBase64) return;
+
+  // No-op after the first successful call (memoized in voiceService) —
+  // usually already done by the time a notification arrives, since using
+  // the mic assistant even once triggers it, but a notification can be the
+  // very first native-audio interaction if the app just launched.
+  const ready = await ensureNativeAudioInitialized();
+  if (!ready) {
+    console.warn("🔔 speakNotification: native audio not ready, skipping playback");
+    return;
   }
-  const base64Audio = btoa(binary);
 
-  const fileUri = `${FileSystem.cacheDirectory}notif-${Date.now()}.wav`;
-  await FileSystem.writeAsStringAsync(fileUri, base64Audio, { encoding: "base64" });
-  await ensurePlaybackAudioMode();
-
-  await new Promise<void>((resolve) => {
-    let settled = false;
-    let soundRef: Audio.Sound | null = null;
-
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(safetyTimer);
-      soundRef?.unloadAsync().catch(() => {});
-      resolve();
-    };
-
-    // Safety net: if didJustFinish never fires (missed event, stuck native
-    // session, etc.) the queue must not hang forever.
-    const safetyTimer = setTimeout(() => {
-      console.warn("🔔 speakNotification: playback timed out, forcing finish");
-      finish();
-    }, PLAYBACK_TIMEOUT_MS);
-
-    // The status callback MUST be passed here, as createAsync's third
-    // argument, rather than attached afterward via
-    // sound.setOnPlaybackStatusUpdate() — with shouldPlay: true, playback
-    // can start (and for a short clip, finish) before a listener attached
-    // after the fact ever gets a chance to see it, which leaves this
-    // promise — and the whole speak queue behind it — waiting forever.
-    Audio.Sound.createAsync(
-      { uri: fileUri },
-      { shouldPlay: true },
-      (status) => {
-        if (status.isLoaded && status.didJustFinish) finish();
-      }
-    )
-      .then(({ sound }) => {
-        soundRef = sound;
-      })
-      .catch((err) => {
-        console.warn("🔔 speakNotification: failed to load/play audio:", err);
-        finish();
-      });
-  });
+  const player = createNativePcmPlayer();
+  player.pushChunk(audioBase64);
+  await withTimeout(player.finish(), PLAYBACK_TIMEOUT_MS, "speakNotification playback");
 
   console.log(`🔔 finished speaking notification from ${n.appName || n.packageName}`);
 }
