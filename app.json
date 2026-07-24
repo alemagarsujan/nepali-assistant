@@ -9,8 +9,10 @@
       "supportsTablet": false,
       "infoPlist": {
         "NSMicrophoneUsageDescription": "बोलेर कुरा गर्नको लागि माइक्रोफोन चाहिन्छ।",
-        "NSContactsUsageDescription": "फोन गर्नको लागि तपाईंको सम्पर्क सूची चाहिन्छ।"
-      }
+        "NSContactsUsageDescription": "फोन गर्नको लागि तपाईंको सम्पर्क सूची चाहिन्छ।",
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "bundleIdentifier": "com.sahayogi.assistant"
     },
     "android": {
       "permissions": [

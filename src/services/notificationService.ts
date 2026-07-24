@@ -118,6 +118,69 @@ async function speakNotification(n: NotificationData): Promise<void> {
   });
 }
 
+// Skips anything that looks like a one-time code or a financial/banking
+// notification — these can come from literally any app (Gmail forwarding an
+// OTP email, the default Messages app for an SMS OTP, a bank/wallet app's
+// own notification, etc.), so this is content-based rather than tied to
+// specific package names. Matched text is never sent anywhere, including to
+// our own backend — the check runs before speakNotification() is ever
+// called, so a code or balance never leaves the device.
+const OTP_PATTERNS = [
+  /\botp\b/i,
+  /one[\s-]?time\s?(password|code|pin)/i,
+  /verification\s?code/i,
+  /security\s?code/i,
+  /auth(entication)?\s?code/i,
+  /login\s?code/i,
+  /access\s?code/i,
+  /pass\s?code/i,
+  /\b2fa\b/i,
+  /\bpin\s?is\b/i,
+  /do not share.*code/i,
+  /गोप्य कोड/,
+  /प्रमाणीकरण कोड/,
+  /भेरिफिकेसन कोड/,
+  /एकपटक.*कोड/,
+];
+
+const FINANCIAL_PATTERNS = [
+  /\bdebited\b/i,
+  /\bcredited\b/i,
+  /\bdebit\b/i,
+  /\bcredit\b/i,
+  /transaction/i,
+  /\bupi\b/i,
+  /\bneft\b/i,
+  /\bimps\b/i,
+  /\brtgs\b/i,
+  /a\/?c\s?(balance|no)/i,
+  /available\s?bal/i,
+  /account\s?balance/i,
+  /wallet\s?balance/i,
+  /withdrawn/i,
+  /deposited/i,
+  /paid\s?(to|via|from)/i,
+  /payment\s?(received|sent|of)/i,
+  /\bemi\b/i,
+  /card\s?ending/i,
+  /insufficient\s?funds/i,
+  /esewa/i,
+  /khalti/i,
+  /imepay/i,
+  /connectips/i,
+  /बैंक/,
+  /खाता/,
+  /रकम/,
+  /भुक्तानी/,
+  /जम्मा/,
+  /निकासी/,
+];
+
+function isSensitiveNotification(n: NotificationData): boolean {
+  const combined = `${n.title} ${n.text} ${n.bigText} ${n.subText}`;
+  return OTP_PATTERNS.some((p) => p.test(combined)) || FINANCIAL_PATTERNS.some((p) => p.test(combined));
+}
+
 // The library itself only dedupes the exact same notification key within a
 // 500ms window (meant for catching duplicate system callbacks, not repeat
 // notifications) — a progress bar or media-player notification that updates
@@ -145,11 +208,14 @@ function isDuplicate(n: NotificationData): boolean {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let activeSubscription: any = null;
 
-// Starts listening for every notification from every app (subject to the
-// filtering above) and speaks each one aloud, translated to Nepali if
-// needed. Only call this when isNotificationListenerAvailable is true and
-// hasNotificationListenerPermission() is true. Safe to call repeatedly —
-// a second call while already running is a no-op.
+// Starts listening for every notification from every app — except anything
+// that looks like an OTP/verification code or a financial/banking
+// notification (see isSensitiveNotification above), which are skipped
+// entirely and never leave the device — and speaks the rest aloud,
+// translated to Nepali if needed. Only call this when
+// isNotificationListenerAvailable is true and hasNotificationListenerPermission()
+// is true. Safe to call repeatedly — a second call while already running is
+// a no-op.
 export function startNotificationListener(): void {
   if (activeSubscription) return;
   const mod = getListenerModule();
@@ -164,6 +230,7 @@ export function startNotificationListener(): void {
   activeSubscription = mod.addListener("onNotificationReceived", (n: NotificationData) => {
     if (!n || n.packageName === OWN_PACKAGE_NAME) return;
     if (!n.title && !n.text && !n.bigText) return;
+    if (isSensitiveNotification(n)) return;
     if (isDuplicate(n)) return;
     enqueueSpeak(() => speakNotification(n));
   });
