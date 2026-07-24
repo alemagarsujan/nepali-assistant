@@ -23,6 +23,13 @@
       ],
       "package": "com.sahayogi.assistant"
     },
-    "plugins": ["expo-secure-store"]
+    "plugins": [
+      "expo-secure-store"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "48e890b9-f6f0-4df5-942b-b39a3aff7be8"
+      }
+    }
   }
 }

@@ -377,7 +377,17 @@ const FIRST_SEGMENT_BYTES = 144000; // ~3s of 24kHz mono 16-bit PCM (see pcmToWa
 const port = process.env.PORT || 3000;
 const server = app.listen(port, () => console.log(`Sahayogi backend running on port ${port}`));
 
-const streamWss = new WebSocket.Server({ server, path: "/ws/assistant" });
+// noServer + manual pathname dispatch, not `{ server, path }` on each one.
+// With two `new WebSocket.Server({ server, path })` instances attached to
+// the same HTTP server, Node calls BOTH of their internal 'upgrade'
+// listeners for every upgrade request, in registration order. `ws`'s own
+// path-mismatch handling (shouldHandle()) responds to a mismatch by writing
+// an HTTP 400 and destroying the socket — so the first-registered server
+// (streamWss) was aborting every connection meant for liveWss's path before
+// liveWss's own listener ever got a chance to run. That's the documented
+// "multiple paths on one server" pattern from the ws README — one shared
+// upgrade listener, routed by pathname, is the actually-safe version.
+const streamWss = new WebSocket.Server({ noServer: true });
 
 streamWss.on("connection", (clientWs) => {
   const t0 = Date.now();
@@ -459,7 +469,7 @@ streamWss.on("connection", (clientWs) => {
 // voiceService.ts: the native module is only used for capturing the mic in
 // real time here, not for playback). Only the input side is genuinely live;
 // the reply audio pipeline is untouched on purpose.
-const liveWss = new WebSocket.Server({ server, path: "/ws/assistant-live" });
+const liveWss = new WebSocket.Server({ noServer: true });
 
 liveWss.on("connection", (clientWs) => {
   const t0 = Date.now();
@@ -656,4 +666,24 @@ liveWss.on("connection", (clientWs) => {
       geminiWs?.close();
     } catch {}
   });
+});
+
+// Single shared upgrade handler for both WS servers, dispatching by
+// pathname. This is the documented-safe way to run more than one `ws`
+// WebSocketServer off the same HTTP server (see the ws README's "multiple
+// paths" example) — each server above is created with `noServer: true` so
+// it never registers its own competing 'upgrade' listener.
+server.on("upgrade", (request, socket, head) => {
+  const pathname = request.url.split("?")[0];
+  if (pathname === "/ws/assistant") {
+    streamWss.handleUpgrade(request, socket, head, (ws) => {
+      streamWss.emit("connection", ws, request);
+    });
+  } else if (pathname === "/ws/assistant-live") {
+    liveWss.handleUpgrade(request, socket, head, (ws) => {
+      liveWss.emit("connection", ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
 });

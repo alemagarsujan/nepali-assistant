@@ -15,6 +15,7 @@
     "expo-av": "~16.0.8",
     "expo-constants": "~18.0.9",
     "expo-contacts": "~15.0.11",
+    "expo-dev-client": "~6.0.21",
     "expo-file-system": "~19.0.23",
     "expo-linking": "~8.0.12",
     "expo-notifications": "~0.32.17",
