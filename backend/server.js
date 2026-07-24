@@ -475,6 +475,19 @@ streamWss.on("connection", (clientWs) => {
 // being sent on. See voiceService.ts's createNativePcmPlayer().
 const liveWss = new WebSocket.Server({ noServer: true });
 
+// This app is one person talking to their own assistant, not a multi-user
+// service — so a single module-level "last session" handle is enough to
+// give every new turn memory of previous ones, without the client needing
+// to track or send anything. Each turn is its own WS connection/Gemini
+// session (see openGemini() below), but passing this handle in as
+// sessionResumption.handle tells Gemini "this is a continuation," and it
+// restores the prior audio/text context itself — no need to replay old
+// audio or maintain a transcript ourselves. Handles are valid for 2 hours
+// after the last session ends (per Gemini's docs); if it's stale or this
+// process restarted (Render redeploy), Gemini just starts a fresh session
+// instead of erroring, so this fails safe.
+let lastLiveSessionHandle = null;
+
 // One ffmpeg process per connection, fed 24kHz PCM as it arrives from
 // Gemini and emitting 16kHz PCM as fast as it can, rather than spawning a
 // new process per chunk (which would add real subprocess-startup latency
@@ -534,7 +547,9 @@ liveWss.on("connection", (clientWs) => {
   });
 
   function openGemini() {
-    console.log(`⏱ [live ${elapsed()}] opening Gemini websocket`);
+    console.log(
+      `⏱ [live ${elapsed()}] opening Gemini websocket${lastLiveSessionHandle ? " (resuming previous session)" : " (new session)"}`
+    );
     geminiWs = new WebSocket(GEMINI_WS_URL);
 
     timeout = setTimeout(() => {
@@ -569,6 +584,13 @@ liveWss.on("connection", (clientWs) => {
             realtimeInputConfig: {
               automaticActivityDetection: { disabled: true },
             },
+            // Passing the last handle here (or {} the very first time) is
+            // what gives follow-up questions memory of earlier ones —
+            // Gemini restores the previous turns' audio/text context itself.
+            sessionResumption: lastLiveSessionHandle ? { handle: lastLiveSessionHandle } : {},
+            // Keeps a long-running back-and-forth from eventually hitting
+            // the session's context window limit as history accumulates.
+            contextWindowCompression: { slidingWindow: {} },
           },
         })
       );
@@ -580,6 +602,14 @@ liveWss.on("connection", (clientWs) => {
         msg = JSON.parse(raw.toString());
       } catch {
         return;
+      }
+
+      // Arrives periodically throughout the session (not just once at
+      // setup) — always take the latest one so the *next* turn resumes
+      // from as close to "now" as possible.
+      if (msg.sessionResumptionUpdate?.resumable && msg.sessionResumptionUpdate?.newHandle) {
+        lastLiveSessionHandle = msg.sessionResumptionUpdate.newHandle;
+        console.log(`⏱ [live ${elapsed()}] session handle updated (memory carried to next turn)`);
       }
 
       if ((msg.setupComplete || msg.sessionResumptionUpdate) && !setupDone) {
