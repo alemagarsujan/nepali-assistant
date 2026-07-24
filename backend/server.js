@@ -311,6 +311,37 @@ app.post("/api/assistant", upload.single("audio"), async (req, res) => {
   }
 });
 
+// Shared by /api/speak and /api/notify-speak — takes Nepali (or any) text,
+// returns a ready-to-play WAV Buffer. Throws on failure; callers decide the
+// HTTP response.
+async function synthesizeSpeech(text) {
+  const ttsRes = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text }] }],
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } },
+        },
+      }),
+    }
+  );
+
+  if (!ttsRes.ok) {
+    const errText = await ttsRes.text();
+    throw new Error(`Gemini TTS failed: ${errText}`);
+  }
+
+  const data = await ttsRes.json();
+  const base64Pcm = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  if (!base64Pcm) throw new Error("Gemini TTS returned no audio");
+
+  return pcmToWav(Buffer.from(base64Pcm, "base64"), 24000);
+}
+
 app.post("/api/speak", async (req, res) => {
   try {
     const { text } = req.body;
@@ -318,37 +349,71 @@ app.post("/api/speak", async (req, res) => {
       return res.status(400).json({ error: "invalid_text" });
     }
 
-    const ttsRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text }] }],
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } },
-          },
-        }),
-      }
-    );
-
-    if (!ttsRes.ok) {
-      const errText = await ttsRes.text();
-      console.error("Gemini TTS failed:", errText);
-      return res.status(502).json({ error: "tts_failed" });
-    }
-
-    const data = await ttsRes.json();
-    const base64Pcm = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!base64Pcm) return res.status(502).json({ error: "tts_no_audio" });
-
-    const wavOut = pcmToWav(Buffer.from(base64Pcm, "base64"), 24000);
+    const wavOut = await synthesizeSpeech(text);
     res.set("Content-Type", "audio/wav");
     res.send(wavOut);
   } catch (err) {
     console.error("speak error:", err);
     res.status(500).json({ error: "tts_failed" });
+  }
+});
+
+// Turns a phone notification (from any app, possibly in English) into one
+// short spoken Nepali sentence and returns the audio. Two Gemini calls: a
+// plain text one to translate/summarize/phrase it, then TTS on the result
+// — this endpoint is for background announcements (see
+// notificationService.ts), not a live conversation, so the extra second or
+// two of latency compared to the live path doesn't matter here the way it
+// would there.
+function buildNotificationPrompt(appName, title, text) {
+  return [
+    "तपाईं एउटा सहायक हुनुहुन्छ जसले फोनमा आएको सूचना (notification) लाई प्रयोगकर्तालाई सुनाउनको लागि एउटै छोटो, बोलिने नेपाली वाक्यमा बदल्नुहुन्छ।",
+    "यदि सूचना अंग्रेजी वा अरू भाषामा छ भने नेपालीमा अनुवाद गर्नुहोस्। एप्को नाम पनि उल्लेख गर्नुहोस् (जस्तै: 'व्हाट्सएपबाट...').",
+    "जवाफमा एउटै वाक्य मात्र दिनुहोस् — अरू केही नलेख्नुहोस्, व्याख्या नगर्नुहोस्।",
+    "",
+    `एप: ${appName || "थाहा छैन"}`,
+    `शीर्षक: ${title || ""}`,
+    `सन्देश: ${text || ""}`,
+  ].join("\n");
+}
+
+app.post("/api/notify-speak", async (req, res) => {
+  try {
+    const appName = typeof req.body.appName === "string" ? req.body.appName.slice(0, 100) : "";
+    const title = typeof req.body.title === "string" ? req.body.title.slice(0, 300) : "";
+    const text = typeof req.body.text === "string" ? req.body.text.slice(0, 1000) : "";
+    if (!title && !text) {
+      return res.status(400).json({ error: "invalid_notification" });
+    }
+
+    const composeRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: buildNotificationPrompt(appName, title, text) }] }],
+        }),
+      }
+    );
+
+    if (!composeRes.ok) {
+      const errText = await composeRes.text();
+      console.error("notify-speak compose failed:", errText);
+      return res.status(502).json({ error: "compose_failed" });
+    }
+
+    const composeData = await composeRes.json();
+    const spokenText = composeData.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    if (!spokenText) return res.status(502).json({ error: "compose_empty" });
+
+    const wavOut = await synthesizeSpeech(spokenText);
+    res.set("Content-Type", "audio/wav");
+    res.set("X-Spoken-Text", encodeURIComponent(spokenText));
+    res.send(wavOut);
+  } catch (err) {
+    console.error("notify-speak error:", err);
+    res.status(500).json({ error: "notify_speak_failed" });
   }
 });
 

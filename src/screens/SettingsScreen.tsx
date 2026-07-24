@@ -1,6 +1,13 @@
-import React, { useState } from "react";
-import { Alert, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import React, { useCallback, useEffect, useState } from "react";
+import { Alert, AppState, StyleSheet, Switch, Text, TouchableOpacity, View } from "react-native";
 import { strings } from "../i18n/ne";
+import {
+  hasNotificationListenerPermission,
+  isNotificationListenerAvailable,
+  openNotificationListenerSettings,
+  startNotificationListener,
+  stopNotificationListener,
+} from "../services/notificationService";
 import { secureStorage } from "../services/secureStorage";
 
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://nepali-assistant.onrender.com";
@@ -13,6 +20,28 @@ const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL ?? "https://nepali-assis
 
 export default function SettingsScreen() {
   const [pairingCode, setPairingCode] = useState<string | null>(null);
+  const [notifEnabled, setNotifEnabled] = useState(false);
+  const [hasPermission, setHasPermission] = useState(false);
+
+  const refreshPermission = useCallback(() => {
+    if (isNotificationListenerAvailable) {
+      setHasPermission(hasNotificationListenerPermission());
+    }
+  }, []);
+
+  useEffect(() => {
+    secureStorage.getNotificationReadingEnabled().then(setNotifEnabled);
+    refreshPermission();
+
+    // The notification-listener permission is granted from a system
+    // settings screen outside the app (see openNotificationListenerSettings
+    // below) — there's no callback for that, so re-check whenever the app
+    // comes back to the foreground instead.
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") refreshPermission();
+    });
+    return () => sub.remove();
+  }, [refreshPermission]);
 
   async function handlePairCaregiver() {
     try {
@@ -31,9 +60,26 @@ export default function SettingsScreen() {
       {
         text: "मेटाउनुहोस्",
         style: "destructive",
-        onPress: () => secureStorage.wipeAll(),
+        onPress: () => {
+          stopNotificationListener();
+          setNotifEnabled(false);
+          secureStorage.wipeAll();
+        },
       },
     ]);
+  }
+
+  async function handleToggleNotifications(value: boolean) {
+    if (value && !hasPermission) {
+      // Can't turn it on without the permission — send them to grant it
+      // instead of silently flipping the switch back off.
+      openNotificationListenerSettings();
+      return;
+    }
+    setNotifEnabled(value);
+    await secureStorage.setNotificationReadingEnabled(value);
+    if (value) startNotificationListener();
+    else stopNotificationListener();
   }
 
   return (
@@ -50,6 +96,34 @@ export default function SettingsScreen() {
           <Text style={styles.code}>{pairingCode}</Text>
         </View>
       )}
+
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>{strings.settings.notifications.title}</Text>
+        <Text style={styles.sectionDescription}>{strings.settings.notifications.description}</Text>
+
+        {!isNotificationListenerAvailable ? (
+          <Text style={styles.hint}>{strings.settings.notifications.androidOnly}</Text>
+        ) : (
+          <>
+            <View style={styles.switchRow}>
+              <Text style={styles.switchLabel}>
+                {notifEnabled ? strings.settings.notifications.toggleOn : strings.settings.notifications.toggleOff}
+              </Text>
+              <Switch value={notifEnabled && hasPermission} onValueChange={handleToggleNotifications} />
+            </View>
+
+            {!hasPermission && (
+              <>
+                <Text style={styles.hint}>{strings.settings.notifications.needsPermission}</Text>
+                <TouchableOpacity style={styles.button} onPress={openNotificationListenerSettings}>
+                  <Text style={styles.buttonText}>{strings.settings.notifications.permissionButton}</Text>
+                </TouchableOpacity>
+                <Text style={styles.hint}>{strings.settings.notifications.permissionHint}</Text>
+              </>
+            )}
+          </>
+        )}
+      </View>
 
       <TouchableOpacity style={styles.dangerButton} onPress={handleWipeData}>
         <Text style={styles.dangerButtonText}>मेरो सबै डाटा मेटाउनुहोस्</Text>
@@ -72,6 +146,18 @@ const styles = StyleSheet.create({
   codeBox: { alignItems: "center", marginVertical: 20 },
   codeLabel: { fontSize: 16, color: "#555" },
   code: { fontSize: 36, fontWeight: "800", letterSpacing: 4, marginTop: 8 },
+  section: {
+    marginTop: 24,
+    marginBottom: 8,
+    padding: 16,
+    borderRadius: 10,
+    backgroundColor: "#f5f5f5",
+  },
+  sectionTitle: { fontSize: 20, fontWeight: "700", marginBottom: 8 },
+  sectionDescription: { fontSize: 15, color: "#555", marginBottom: 16 },
+  switchRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  switchLabel: { fontSize: 17, fontWeight: "600", flex: 1, marginRight: 12 },
+  hint: { fontSize: 14, color: "#888", marginTop: 8, marginBottom: 8 },
   dangerButton: {
     borderColor: "#C62828",
     borderWidth: 1,

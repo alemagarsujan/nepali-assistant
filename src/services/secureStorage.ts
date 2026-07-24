@@ -14,6 +14,7 @@ import * as SecureStore from "expo-secure-store";
 const REMINDERS_KEY = "reminders_v1";
 const CONTACTS_KEY = "contacts_v1";
 const CAREGIVER_KEY = "caregiver_pairing_v1";
+const NOTIFICATION_READING_ENABLED_KEY = "notification_reading_enabled_v1";
 
 async function getJSON<T>(key: string, fallback: T): Promise<T> {
   try {
@@ -44,10 +45,15 @@ export const secureStorage = {
   setCaregiverPairing: (pairing: import("../types").CaregiverPairing | null) =>
     setJSON(CAREGIVER_KEY, pairing),
 
+  getNotificationReadingEnabled: () => getJSON(NOTIFICATION_READING_ENABLED_KEY, false),
+  setNotificationReadingEnabled: (enabled: boolean) =>
+    setJSON(NOTIFICATION_READING_ENABLED_KEY, enabled),
+
   // Full wipe — expose this in Settings as "Erase my data" for user trust.
   wipeAll: async () => {
     await SecureStore.deleteItemAsync(REMINDERS_KEY);
     await SecureStore.deleteItemAsync(CONTACTS_KEY);
     await SecureStore.deleteItemAsync(CAREGIVER_KEY);
+    await SecureStore.deleteItemAsync(NOTIFICATION_READING_ENABLED_KEY);
   },
 };
