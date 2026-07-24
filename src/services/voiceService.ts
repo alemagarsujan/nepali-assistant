@@ -80,40 +80,32 @@ async function loadSegment(base64Wav: string): Promise<Audio.Sound> {
     .toString(36)
     .slice(2)}.wav`;
   await FileSystem.writeAsStringAsync(fileUri, base64Wav, { encoding: "base64" });
-  // Default progressUpdateIntervalMillis is 500ms — far too coarse to catch
-  // a ~150ms "about to end" window (SEGMENT_OVERLAP_MS below); the overlap
-  // logic would silently never fire and every transition would fall back to
-  // the plain didJustFinish path, i.e. no actual overlap. 50ms gives the
-  // early-start check enough resolution to actually land inside the window.
-  const { sound } = await Audio.Sound.createAsync(
-    { uri: fileUri },
-    { shouldPlay: false, progressUpdateIntervalMillis: 50 }
-  );
+  const { sound } = await Audio.Sound.createAsync({ uri: fileUri }, { shouldPlay: false });
   return sound;
 }
 
-// How much earlier (in ms) to start the next segment before the current one
-// actually reaches its end. Starting a new Sound has real native-engine
-// startup latency (allocating a player, priming the audio buffer) — waiting
-// for didJustFinish before calling playAsync() on the next one means that
-// latency shows up as an audible gap at every single segment boundary. By
-// starting the next segment this many ms early, that startup latency
-// overlaps the tail of the current segment instead of landing as silence.
-const SEGMENT_OVERLAP_MS = 150;
-
 // expo-av's Sound API loads and plays one complete source at a time — there's
 // no "append to a currently-playing stream" primitive. This fakes streaming
-// by playing a queue of WAV segments back-to-back, double-buffered (the next
-// segment is written+decoded in the background while the current one plays)
-// and started slightly before the current one ends (see SEGMENT_OVERLAP_MS)
-// so the transition doesn't depend on perfect zero-latency scheduling.
+// by playing a queue of WAV segments back-to-back, double-buffered: the next
+// segment is written to disk and decoded in the background while the
+// current one plays, so by the time the current one finishes, the next is
+// already fully loaded and playAsync() can be called immediately — no file
+// I/O or decode work left to do on the critical path.
+//
+// An earlier version tried to additionally start the next segment ~150ms
+// *before* the current one actually finished, to hide the small amount of
+// native player start-up latency that's left even with preloading. That was
+// wrong: unlike music, these segments are arbitrary slices of one
+// continuous sentence, so overlapping them means playing two different
+// parts of the same speech at once — which sounds like two overlapping
+// voices, not a smooth blend. Removed; segments now only ever play one at a
+// time, transitioning as soon as the current one reports didJustFinish.
 export function createStreamingPlayer(): StreamingPlayer {
   const queue: string[] = [];
   let current: Audio.Sound | null = null;
   let preloaded: Audio.Sound | null = null;
   let preloading = false;
   let finished = false;
-  let advancedEarly = false;
   let onAllDone: (() => void) | null = null;
   const modeReady = ensurePlaybackAudioMode();
 
@@ -146,30 +138,11 @@ export function createStreamingPlayer(): StreamingPlayer {
     if (!sound) return;
     preloaded = null;
     current = sound;
-    advancedEarly = false;
 
     sound.setOnPlaybackStatusUpdate((status) => {
       if (!status.isLoaded) return;
-
-      // Fire the next segment a little before this one truly ends, so its
-      // startup latency overlaps this segment's tail instead of creating a
-      // silent gap. Only does anything once the next segment has actually
-      // finished preloading.
-      if (
-        !advancedEarly &&
-        preloaded &&
-        status.durationMillis != null &&
-        status.positionMillis >= status.durationMillis - SEGMENT_OVERLAP_MS
-      ) {
-        advancedEarly = true;
-        startCurrent(); // promotes `preloaded` to `current`, starts it
-        ensurePreload();
-      }
-
       if (status.didJustFinish) {
         sound.unloadAsync().catch(() => {});
-        // If we already moved on early, `current` now points at the next
-        // segment — don't clobber it or double-advance.
         if (current === sound) {
           current = null;
           advance();
