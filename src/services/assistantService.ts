@@ -22,6 +22,18 @@ export interface StreamingHandlers {
   onError: (err: Error) => void;
 }
 
+export interface LiveConnection {
+  // Send one chunk of raw 16kHz mono PCM captured from the mic, as soon as
+  // it's captured — don't wait for recording to finish.
+  pushMicChunk(base64Pcm: string): void;
+  // Call when the user releases the button — tells the backend to close out
+  // the Gemini turn (activityEnd). Reply audio/intent/done still arrive via
+  // the handlers passed to connectLive() after this.
+  stop(): void;
+  // Force-close the connection (e.g. on error/unmount).
+  close(): void;
+}
+
 // Replaces llmService.ts. Where the old flow was three separate calls
 // (transcribe -> interpret -> speak, each a full round trip), this is one:
 // upload the recording, get back the structured intent AND the spoken
@@ -122,5 +134,69 @@ export const assistantService = {
         handlers.onError(err instanceof Error ? err : new Error(String(err)));
       }
     })();
+  },
+
+  // True live variant: opens the connection and tells the backend to start
+  // talking to Gemini immediately (on record-start, not record-stop), then
+  // lets the caller push mic chunks as voiceService.startNativeMicStream()
+  // produces them. Only usable when voiceService.isNativeMicStreamingAvailable
+  // is true — this needs real-time mic access that Expo Go doesn't have.
+  // Reply audio (onAudioChunk) still arrives as WAV segments, same as
+  // sendStreaming() — only the input side is genuinely live here.
+  connectLive(knownContactNames: string[], handlers: StreamingHandlers): LiveConnection {
+    const t0 = Date.now();
+    const ws = new WebSocket(`${WS_BACKEND_URL}/ws/assistant-live`);
+
+    ws.onopen = () => {
+      console.log(`⏱ [client] live ws open after ${Date.now() - t0}ms, starting turn`);
+      ws.send(JSON.stringify({ type: "start", knownContactNames }));
+    };
+
+    ws.onmessage = (event) => {
+      let msg: any;
+      try {
+        msg = JSON.parse(event.data as string);
+      } catch {
+        return;
+      }
+      switch (msg.type) {
+        case "intent":
+          handlers.onIntent(msg.intent as AssistantIntent);
+          break;
+        case "audio_chunk":
+          console.log(`⏱ [client] live reply segment received after ${Date.now() - t0}ms`);
+          handlers.onAudioChunk(msg.data as string);
+          break;
+        case "done":
+          console.log(`⏱ [client] live stream done after ${Date.now() - t0}ms`);
+          handlers.onDone();
+          ws.close();
+          break;
+        case "error":
+          handlers.onError(new Error(msg.error ?? "assistant_failed"));
+          ws.close();
+          break;
+      }
+    };
+
+    ws.onerror = () => {
+      handlers.onError(new Error("assistant_live_ws_error"));
+    };
+
+    return {
+      pushMicChunk(base64Pcm: string) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "audio_chunk_in", data: base64Pcm }));
+        }
+      },
+      stop() {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "stop" }));
+        }
+      },
+      close() {
+        ws.close();
+      },
+    };
   },
 };

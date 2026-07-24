@@ -15,6 +15,7 @@
     "android": {
       "permissions": [
         "RECORD_AUDIO",
+        "MODIFY_AUDIO_SETTINGS",
         "READ_CONTACTS",
         "CALL_PHONE",
         "SCHEDULE_EXACT_ALARM",

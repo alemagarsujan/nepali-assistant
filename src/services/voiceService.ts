@@ -1,4 +1,5 @@
 import { Audio } from "expo-av";
+import Constants, { ExecutionEnvironment } from "expo-constants";
 import * as FileSystem from "expo-file-system/legacy";
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -63,6 +64,99 @@ const SPEECH_RECORDING_OPTIONS: Audio.RecordingOptions = {
     bitsPerSecond: 48000,
   },
 };
+
+// Expo Go can only load its own fixed set of built-in native modules — a
+// custom native module like @speechmatics/expo-two-way-audio isn't one of
+// them. This app still needs to keep running in Expo Go (that's what's on
+// the iPhone), so the package is never statically imported: a top-level
+// `import` gets evaluated by Metro for every platform the same JS bundle
+// might run on, not just the one it's currently running on, and that alone
+// is enough to crash the app on launch inside Expo Go. Instead it's loaded
+// with require() lazily, and only after confirming we're in a dev-client/
+// standalone build, never inside Expo Go.
+export const isNativeMicStreamingAvailable = Constants.executionEnvironment !== ExecutionEnvironment.StoreClient;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let twoWayAudio: any = undefined;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getTwoWayAudio(): any {
+  if (!isNativeMicStreamingAvailable) return null;
+  if (twoWayAudio !== undefined) return twoWayAudio;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    twoWayAudio = require("@speechmatics/expo-two-way-audio");
+  } catch (err) {
+    console.warn("native mic streaming module unavailable:", err);
+    twoWayAudio = null;
+  }
+  return twoWayAudio;
+}
+
+let nativeAudioReady: Promise<boolean> | null = null;
+function ensureNativeAudioInitialized(): Promise<boolean> {
+  if (nativeAudioReady) return nativeAudioReady;
+  nativeAudioReady = (async () => {
+    const mod = getTwoWayAudio();
+    if (!mod) return false;
+    try {
+      const perm = await mod.requestMicrophonePermissionsAsync();
+      if (!perm.granted) return false;
+      await mod.initialize();
+      return true;
+    } catch (err) {
+      console.warn("native audio init failed:", err);
+      return false;
+    }
+  })();
+  return nativeAudioReady;
+}
+
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+export interface NativeMicStream {
+  // Stops capturing and tears down the listener. Safe to call once.
+  stop(): void;
+}
+
+// Streams raw 16kHz mono 16-bit PCM straight from the mic to onChunk as it's
+// captured, instead of only being available once as a finished file after
+// the user stops talking. That's the whole point: it lets the caller start
+// forwarding audio to the backend (and from there to Gemini) while the user
+// is still mid-sentence, so by the time they release the button most of
+// what they said has already been processed instead of none of it.
+//
+// Only call this when isNativeMicStreamingAvailable is true — check it
+// first and fall back to startRecording()/stopRecordingToFile() otherwise
+// (that's the only option in Expo Go).
+export async function startNativeMicStream(onChunk: (base64Pcm: string) => void): Promise<NativeMicStream> {
+  const mod = getTwoWayAudio();
+  if (!mod) throw new Error("native mic streaming unavailable");
+  const ready = await ensureNativeAudioInitialized();
+  if (!ready) throw new Error("native mic init or permission failed");
+
+  const subscription = mod.addExpoTwoWayAudioEventListener(
+    "onMicrophoneData",
+    (event: { data: Uint8Array }) => {
+      onChunk(uint8ToBase64(event.data));
+    }
+  );
+  mod.toggleRecording(true);
+
+  return {
+    stop() {
+      mod.toggleRecording(false);
+      subscription.remove();
+    },
+  };
+}
 
 export interface StreamingPlayer {
   // Queue a base64-encoded WAV segment for playback. Plays immediately if

@@ -440,3 +440,220 @@ streamWss.on("connection", (clientWs) => {
     }
   });
 });
+
+// True live-streaming twin of /ws/assistant, for phones running a native
+// build with real-time mic access (see voiceService.ts's native path — Expo
+// Go can't do this, only a dev client build can). The difference from
+// /ws/assistant isn't just transport: there, the phone waits until the user
+// releases the button, THEN uploads one finished recording, THEN Gemini
+// starts listening to any of it. Here, the mic module hands us 16kHz mono
+// PCM chunks *while the user is still talking*, already in the exact format
+// Gemini wants — no ffmpeg conversion needed — so we open the Gemini
+// connection and start feeding it audio immediately. By the time the user
+// releases the button, Gemini has usually already processed most of what
+// they said, instead of not having heard any of it yet.
+//
+// Reply audio still goes out the same way as /ws/assistant — buffered into
+// one short starter WAV segment plus one final segment, not raw per-chunk —
+// because playback on the phone still goes through expo-av either way (see
+// voiceService.ts: the native module is only used for capturing the mic in
+// real time here, not for playback). Only the input side is genuinely live;
+// the reply audio pipeline is untouched on purpose.
+const liveWss = new WebSocket.Server({ server, path: "/ws/assistant-live" });
+
+liveWss.on("connection", (clientWs) => {
+  const t0 = Date.now();
+  const elapsed = () => `${Date.now() - t0}ms`;
+  const send = (payload) => {
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify(payload));
+  };
+
+  let geminiWs = null;
+  let setupDone = false;
+  let clientStopped = false;
+  let knownContactNames = [];
+  const pendingChunks = [];
+  let resultIntent = null;
+  let inputTranscript = "";
+  let outputTranscript = "";
+  let resolved = false;
+  let timeout = null;
+
+  let segmentBuf = [];
+  let segmentBytes = 0;
+  let firstSegmentSent = false;
+  const flushSegment = (isFinal) => {
+    if (!segmentBytes) return;
+    const wavOut = pcmToWav(Buffer.concat(segmentBuf), 24000);
+    console.log(`⏱ [live ${elapsed()}] sending audio segment, wav bytes: ${wavOut.length}${isFinal ? " (final)" : ""}`);
+    send({ type: "audio_chunk", data: wavOut.toString("base64") });
+    segmentBuf = [];
+    segmentBytes = 0;
+  };
+
+  function openGemini() {
+    console.log(`⏱ [live ${elapsed()}] opening Gemini websocket`);
+    geminiWs = new WebSocket(GEMINI_WS_URL);
+
+    timeout = setTimeout(() => {
+      console.log(`⏱ [live ${elapsed()}] Gemini timeout`);
+      try {
+        geminiWs.close();
+      } catch {}
+      send({ type: "error", error: "assistant_failed" });
+    }, 60000);
+
+    geminiWs.on("open", () => {
+      console.log(`⏱ [live ${elapsed()}] websocket open, sending setup`);
+      geminiWs.send(
+        JSON.stringify({
+          setup: {
+            model: `models/${GEMINI_MODEL}`,
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } },
+              thinkingConfig: { thinkingBudget: 0 },
+            },
+            systemInstruction: { parts: [{ text: buildSystemInstruction(knownContactNames) }] },
+            tools: ASSISTANT_TOOLS,
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            // Here we genuinely are feeding a live mic stream, chunk by
+            // chunk, as it's captured — unlike the other endpoints, manual
+            // activityStart/activityEnd (sent below) still gives us an
+            // explicit, reliable turn boundary instead of leaning on
+            // server-side silence detection.
+            realtimeInputConfig: {
+              automaticActivityDetection: { disabled: true },
+            },
+          },
+        })
+      );
+    });
+
+    geminiWs.on("message", (raw) => {
+      let msg;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      if ((msg.setupComplete || msg.sessionResumptionUpdate) && !setupDone) {
+        setupDone = true;
+        console.log(`⏱ [live ${elapsed()}] setupComplete, flushing ${pendingChunks.length} buffered chunk(s)`);
+        geminiWs.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
+        for (const b64 of pendingChunks.splice(0)) {
+          geminiWs.send(
+            JSON.stringify({ realtimeInput: { audio: { data: b64, mimeType: "audio/pcm;rate=16000" } } })
+          );
+        }
+        if (clientStopped) {
+          geminiWs.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+        }
+        return;
+      }
+
+      if (msg.toolCall?.functionCalls?.length) {
+        const call = msg.toolCall.functionCalls[0];
+        resultIntent = { type: call.name, ...call.args };
+        console.log(`⏱ [live ${elapsed()}] intent ready: ${resultIntent.type}`);
+        send({ type: "intent", intent: resultIntent });
+        geminiWs.send(
+          JSON.stringify({
+            toolResponse: {
+              functionResponses: [{ id: call.id, name: call.name, response: { result: "ok" } }],
+            },
+          })
+        );
+      }
+
+      if (msg.serverContent?.modelTurn?.parts) {
+        for (const part of msg.serverContent.modelTurn.parts) {
+          if (part.inlineData?.data) {
+            const chunk = Buffer.from(part.inlineData.data, "base64");
+            segmentBuf.push(chunk);
+            segmentBytes += chunk.length;
+            if (!firstSegmentSent && segmentBytes >= FIRST_SEGMENT_BYTES) {
+              firstSegmentSent = true;
+              flushSegment(false);
+            }
+          }
+        }
+      }
+
+      if (msg.serverContent?.inputTranscription?.text) {
+        inputTranscript += msg.serverContent.inputTranscription.text;
+      }
+      if (msg.serverContent?.outputTranscription?.text) {
+        outputTranscript += msg.serverContent.outputTranscription.text;
+      }
+
+      if ((msg.serverContent?.generationComplete || msg.serverContent?.turnComplete) && !resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        console.log(`⏱ [live ${elapsed()}] turn done`);
+        flushSegment(true);
+        if (!resultIntent) {
+          resultIntent = outputTranscript
+            ? { type: "ask_question", question: inputTranscript, answer: outputTranscript }
+            : { type: "unclear", transcript: inputTranscript };
+          send({ type: "intent", intent: resultIntent });
+        }
+        send({ type: "done", transcript: inputTranscript });
+        try {
+          geminiWs.close();
+        } catch {}
+      }
+    });
+
+    geminiWs.on("error", (err) => {
+      clearTimeout(timeout);
+      console.error("live assistant ws error:", err);
+      send({ type: "error", error: "assistant_failed" });
+    });
+  }
+
+  clientWs.on("message", (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    switch (msg.type) {
+      case "start":
+        knownContactNames = msg.knownContactNames || [];
+        console.log(`⏱ [live ${elapsed()}] start received`);
+        openGemini();
+        break;
+      case "audio_chunk_in":
+        if (!msg.data) return;
+        if (setupDone && geminiWs?.readyState === WebSocket.OPEN) {
+          geminiWs.send(
+            JSON.stringify({ realtimeInput: { audio: { data: msg.data, mimeType: "audio/pcm;rate=16000" } } })
+          );
+        } else {
+          // Setup hasn't finished yet — hold onto it, flushed as soon as
+          // setupComplete arrives above.
+          pendingChunks.push(msg.data);
+        }
+        break;
+      case "stop":
+        clientStopped = true;
+        console.log(`⏱ [live ${elapsed()}] stop received`);
+        if (setupDone && geminiWs?.readyState === WebSocket.OPEN) {
+          geminiWs.send(JSON.stringify({ realtimeInput: { activityEnd: {} } }));
+        }
+        break;
+    }
+  });
+
+  clientWs.on("close", () => {
+    clearTimeout(timeout);
+    try {
+      geminiWs?.close();
+    } catch {}
+  });
+});
