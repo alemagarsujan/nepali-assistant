@@ -81,6 +81,24 @@ function buildSystemInstruction(knownContactNames) {
   ].join("\n");
 }
 
+// Only used by the live endpoint's memory feature. First attempt at giving
+// it memory used historyConfig.initialHistoryInClientContent + a replayed
+// clientContent message — that made Gemini hang completely (full 60s
+// timeout, zero response, not even an error), on every single turn,
+// including the very first one with nothing to replay. Whatever the exact
+// cause, that specialized history-exchange mechanism isn't safe to use with
+// this model. Folding the same history into plain system-instruction text
+// instead is a far older, more basic mechanism that every model reliably
+// supports — less elegant, but it doesn't risk breaking the turn entirely.
+function buildLiveSystemInstruction(knownContactNames, history) {
+  const base = buildSystemInstruction(knownContactNames);
+  if (!history.length) return base;
+  const transcript = history
+    .map((h) => `${h.role === "user" ? "प्रयोगकर्ता" : "सहायक"}: ${h.text}`)
+    .join("\n");
+  return `${base}\n\nअघिल्लो कुराकानी (सन्दर्भको लागि, यसलाई फेरि नदोहोर्याउनुहोस्):\n${transcript}`;
+}
+
 const ASSISTANT_TOOLS = [
   {
     functionDeclarations: [
@@ -480,18 +498,19 @@ const liveWss = new WebSocket.Server({ noServer: true });
 // new turn memory of previous ones, without the client needing to track or
 // send anything.
 //
-// First attempt at this used Gemini's own session-resumption handles
-// (server hands you a token, you pass it into the next connection's
-// setup and Gemini restores its own prior context). That never actually
-// fired in testing — logs showed no sessionResumptionUpdate message ever
-// arriving within these short few-second turns, even waiting a few
-// seconds past turnComplete for one. Best guess: resumption is built for
-// surviving a dropped connection *during* one long call, sent on its own
-// cadence, not guaranteed per short turn. So instead: replay a plain text
-// transcript of recent turns at the start of each new session via
-// clientContent + historyConfig.initialHistoryInClientContent (see
-// openGemini() and the setupComplete handler below) — fully within our
-// control, not dependent on Gemini's own snapshot timing.
+// Two earlier attempts at this didn't pan out:
+//  1. Gemini's own session-resumption handles (server hands you a token,
+//     you pass it into the next connection's setup to restore prior
+//     context) — never actually fired in testing, no
+//     sessionResumptionUpdate ever arrived within these short turns.
+//  2. historyConfig.initialHistoryInClientContent + replaying history as a
+//     clientContent message — this model just hung completely (full 60s
+//     timeout, zero response) the moment that field was added, even on
+//     the very first turn with nothing to replay yet.
+// What actually works: fold the transcript straight into the system
+// instruction text (see buildLiveSystemInstruction) — the most basic,
+// universally-supported mechanism there is, so nothing to silently choke
+// on.
 let conversationHistory = []; // [{ role: "user" | "model", text }]
 const MAX_HISTORY_ENTRIES = 20; // ~10 exchanges — plenty for "what's my name", cheap enough to replay every turn
 
@@ -579,7 +598,10 @@ liveWss.on("connection", (clientWs) => {
               speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } },
               thinkingConfig: { thinkingBudget: 0 },
             },
-            systemInstruction: { parts: [{ text: buildSystemInstruction(knownContactNames) }] },
+            // Prior turns are folded into the instruction text itself (see
+            // buildLiveSystemInstruction) — that's what gives follow-up
+            // questions memory of earlier ones.
+            systemInstruction: { parts: [{ text: buildLiveSystemInstruction(knownContactNames, conversationHistory) }] },
             tools: ASSISTANT_TOOLS,
             inputAudioTranscription: {},
             outputAudioTranscription: {},
@@ -591,12 +613,6 @@ liveWss.on("connection", (clientWs) => {
             realtimeInputConfig: {
               automaticActivityDetection: { disabled: true },
             },
-            // Tells Gemini to expect prior conversation turns as
-            // clientContent messages right after setupComplete, ending
-            // with turnComplete: true, before any realtime audio input
-            // starts — see the setupComplete handler below. That replay is
-            // what gives follow-up questions memory of earlier ones.
-            historyConfig: { initialHistoryInClientContent: true },
             // Keeps a long-running back-and-forth from eventually hitting
             // the session's context window limit as history accumulates.
             contextWindowCompression: { slidingWindow: {} },
@@ -616,21 +632,6 @@ liveWss.on("connection", (clientWs) => {
       if ((msg.setupComplete || msg.sessionResumptionUpdate) && !setupDone) {
         setupDone = true;
         console.log(`⏱ [live ${elapsed()}] setupComplete, flushing ${pendingChunks.length} buffered chunk(s)`);
-        // With historyConfig.initialHistoryInClientContent set in setup,
-        // Gemini waits for a clientContent message (turnComplete: true)
-        // before it'll accept realtimeInput — send one every time, even
-        // with an empty turns[] on the very first-ever turn, rather than
-        // skip it and risk Gemini waiting indefinitely for a history phase
-        // that never arrives. Non-empty, this is what actually gives the
-        // new session memory of prior turns.
-        geminiWs.send(
-          JSON.stringify({
-            clientContent: {
-              turns: conversationHistory.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
-              turnComplete: true,
-            },
-          })
-        );
         geminiWs.send(JSON.stringify({ realtimeInput: { activityStart: {} } }));
         for (const b64 of pendingChunks.splice(0)) {
           geminiWs.send(
