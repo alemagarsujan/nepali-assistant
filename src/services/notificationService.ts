@@ -2,6 +2,7 @@ import { Audio } from "expo-av";
 import Constants, { ExecutionEnvironment } from "expo-constants";
 import * as FileSystem from "expo-file-system/legacy";
 import { Platform } from "react-native";
+import { ensurePlaybackAudioMode } from "./voiceService";
 
 // Reads phone notifications aloud in Nepali, translating from English (or
 // any language) when needed. Android-only: iOS has no API that lets one app
@@ -89,6 +90,16 @@ function enqueueSpeak(job: () => Promise<void>): void {
   speakQueue = speakQueue.then(job).catch((err) => console.warn("notification speak failed:", err));
 }
 
+// Hard ceiling on how long one notification is allowed to hold up the
+// queue. Without this, a playback status event that never fires (see the
+// race note below) or a stuck native audio session would jam every
+// notification behind it forever — and since this shares the phone's
+// single audio hardware with the live assistant's mic/playback session
+// (@speechmatics/expo-two-way-audio), a stuck expo-av Sound here can also
+// starve the assistant of audio access, which is likely why the main
+// assistant stopped responding after a notification failed to finish.
+const PLAYBACK_TIMEOUT_MS = 20_000;
+
 async function speakNotification(n: NotificationData): Promise<void> {
   console.log(`🔔 speaking notification from ${n.appName || n.packageName}: "${n.title}"`);
   const res = await fetch(`${BACKEND_URL}/api/notify-speak`, {
@@ -100,7 +111,10 @@ async function speakNotification(n: NotificationData): Promise<void> {
       text: n.bigText || n.text,
     }),
   });
-  if (!res.ok) throw new Error(`notify-speak failed: ${res.status}`);
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`notify-speak failed: ${res.status} ${errBody}`);
+  }
 
   const arrayBuffer = await res.arrayBuffer();
   let binary = "";
@@ -113,16 +127,50 @@ async function speakNotification(n: NotificationData): Promise<void> {
 
   const fileUri = `${FileSystem.cacheDirectory}notif-${Date.now()}.wav`;
   await FileSystem.writeAsStringAsync(fileUri, base64Audio, { encoding: "base64" });
-  const { sound } = await Audio.Sound.createAsync({ uri: fileUri }, { shouldPlay: true });
+  await ensurePlaybackAudioMode();
 
   await new Promise<void>((resolve) => {
-    sound.setOnPlaybackStatusUpdate((status) => {
-      if (status.isLoaded && status.didJustFinish) {
-        sound.unloadAsync().catch(() => {});
-        resolve();
+    let settled = false;
+    let soundRef: Audio.Sound | null = null;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(safetyTimer);
+      soundRef?.unloadAsync().catch(() => {});
+      resolve();
+    };
+
+    // Safety net: if didJustFinish never fires (missed event, stuck native
+    // session, etc.) the queue must not hang forever.
+    const safetyTimer = setTimeout(() => {
+      console.warn("🔔 speakNotification: playback timed out, forcing finish");
+      finish();
+    }, PLAYBACK_TIMEOUT_MS);
+
+    // The status callback MUST be passed here, as createAsync's third
+    // argument, rather than attached afterward via
+    // sound.setOnPlaybackStatusUpdate() — with shouldPlay: true, playback
+    // can start (and for a short clip, finish) before a listener attached
+    // after the fact ever gets a chance to see it, which leaves this
+    // promise — and the whole speak queue behind it — waiting forever.
+    Audio.Sound.createAsync(
+      { uri: fileUri },
+      { shouldPlay: true },
+      (status) => {
+        if (status.isLoaded && status.didJustFinish) finish();
       }
-    });
+    )
+      .then(({ sound }) => {
+        soundRef = sound;
+      })
+      .catch((err) => {
+        console.warn("🔔 speakNotification: failed to load/play audio:", err);
+        finish();
+      });
   });
+
+  console.log(`🔔 finished speaking notification from ${n.appName || n.packageName}`);
 }
 
 // Skips anything that looks like a one-time code or a financial/banking

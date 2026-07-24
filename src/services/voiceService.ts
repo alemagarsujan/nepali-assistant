@@ -24,7 +24,7 @@ let recording: Audio.Recording | null = null;
 // happens, replies come out of the earpiece instead of the speaker. Switch
 // back to a playback-only session before playing anything; startRecording()
 // switches it back to recording mode for the next turn.
-async function ensurePlaybackAudioMode(): Promise<void> {
+export async function ensurePlaybackAudioMode(): Promise<void> {
   await Audio.setAudioModeAsync({
     allowsRecordingIOS: false,
     playsInSilentModeIOS: true,
