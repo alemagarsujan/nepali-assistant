@@ -365,7 +365,14 @@ app.post("/api/pairing/redeem", (req, res) => {
 // which is frequent enough to sound like constant stuttering. Bigger
 // segments mean far fewer boundaries (a few instead of a dozen+), at the
 // cost of a bit more time before the very first segment is ready.
-const SEGMENT_BYTES = 72000; // 1.5s of 24kHz mono 16-bit PCM (see pcmToWav)
+// Every segment boundary is a chance for expo-av's playback handoff to be
+// audible as a tiny pause (see voiceService.ts) — there's no way to make a
+// handoff perfectly gapless with that API, only fewer of them. So instead of
+// many small segments (which was 4-6 handoffs per reply, each a chance to be
+// heard), send just ONE small first segment to start playback quickly, then
+// buffer everything else into a single final segment. That's one handoff per
+// reply, period, no matter how long the reply runs.
+const FIRST_SEGMENT_BYTES = 144000; // ~3s of 24kHz mono 16-bit PCM (see pcmToWav)
 
 const port = process.env.PORT || 3000;
 const server = app.listen(port, () => console.log(`Sahayogi backend running on port ${port}`));
@@ -395,6 +402,7 @@ streamWss.on("connection", (clientWs) => {
 
       let segmentBuf = [];
       let segmentBytes = 0;
+      let firstSegmentSent = false;
       const flushSegment = (isFinal) => {
         if (!segmentBytes) return;
         const wavOut = pcmToWav(Buffer.concat(segmentBuf), 24000);
@@ -413,7 +421,13 @@ streamWss.on("connection", (clientWs) => {
         onAudioChunk: (chunk) => {
           segmentBuf.push(chunk);
           segmentBytes += chunk.length;
-          if (segmentBytes >= SEGMENT_BYTES) flushSegment(false);
+          // Only the very first segment flushes early (to start playback
+          // quickly); everything after that accumulates into one final
+          // segment sent when the turn ends, so there's only one handoff.
+          if (!firstSegmentSent && segmentBytes >= FIRST_SEGMENT_BYTES) {
+            firstSegmentSent = true;
+            flushSegment(false);
+          }
         },
       });
 

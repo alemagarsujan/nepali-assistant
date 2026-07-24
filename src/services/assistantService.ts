@@ -11,9 +11,12 @@ export interface AssistantResult {
 
 export interface StreamingHandlers {
   onIntent: (intent: AssistantIntent) => void;
-  // Each call is one standalone, independently-playable WAV segment (~500ms
-  // of audio), base64-encoded — hand these straight to
-  // voiceService.createStreamingPlayer()'s pushChunk as they arrive.
+  // Each call is one standalone, independently-playable WAV segment,
+  // base64-encoded — hand these straight to
+  // voiceService.createStreamingPlayer()'s pushChunk as they arrive. The
+  // backend sends exactly two: a short ~3s one to start playback quickly,
+  // then everything else as one final segment, so there's only one
+  // handoff point per reply instead of several.
   onAudioChunk: (base64Wav: string) => void;
   onDone: () => void;
   onError: (err: Error) => void;
