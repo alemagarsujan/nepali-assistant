@@ -546,6 +546,17 @@ liveWss.on("connection", (clientWs) => {
     send({ type: "audio_chunk_pcm", data: pcm16kChunk.toString("base64") });
   });
 
+  let geminiClosed = false;
+  function closeGeminiSoon(afterMs) {
+    setTimeout(() => {
+      if (geminiClosed) return;
+      geminiClosed = true;
+      try {
+        geminiWs.close();
+      } catch {}
+    }, afterMs);
+  }
+
   function openGemini() {
     console.log(
       `⏱ [live ${elapsed()}] opening Gemini websocket${lastLiveSessionHandle ? " (resuming previous session)" : " (new session)"}`
@@ -662,12 +673,15 @@ liveWss.on("connection", (clientWs) => {
         resolved = true;
         clearTimeout(timeout);
         console.log(`⏱ [live ${elapsed()}] turn done, flushing downsampler`);
-        try {
-          geminiWs.close();
-        } catch {}
-        // Wait for every last resampled byte to actually reach the client
-        // before saying we're done — ffmpeg's stdout keeps emitting for a
-        // moment after stdin closes.
+        // Deliberately NOT closing geminiWs here (that used to be a bug):
+        // we resolve on generationComplete, which fires ~2-2.5s *before*
+        // turnComplete — and turnComplete's end-of-turn bookkeeping is
+        // where the sessionResumptionUpdate carrying THIS turn's content
+        // actually gets sent. Closing immediately meant we always hung up
+        // before that handle ever arrived, so the next turn could never
+        // actually remember anything just said. See closeGeminiSoon below
+        // — the client still gets "done" at the same time as before, this
+        // only changes when we say goodbye to Gemini in the background.
         downsampler.finish().then(() => {
           console.log(`⏱ [live ${elapsed()}] downsampler flushed, ${repliedBytes} PCM bytes sent`);
           if (!resultIntent) {
@@ -678,6 +692,17 @@ liveWss.on("connection", (clientWs) => {
           }
           send({ type: "done", transcript: inputTranscript });
         });
+        // Safety net in case turnComplete (below) never arrives for some
+        // reason — don't hold the connection open forever.
+        closeGeminiSoon(5000);
+      }
+
+      // turnComplete specifically (not just generationComplete) is when the
+      // session-resumption handle for this turn actually gets sent — a
+      // short grace period after it arrives is enough to catch it before
+      // closing.
+      if (msg.serverContent?.turnComplete) {
+        closeGeminiSoon(500);
       }
     });
 
@@ -727,10 +752,22 @@ liveWss.on("connection", (clientWs) => {
 
   clientWs.on("close", () => {
     clearTimeout(timeout);
-    downsampler.kill();
-    try {
-      geminiWs?.close();
-    } catch {}
+    if (resolved && geminiWs) {
+      // The client closes its socket to us right after receiving "done" —
+      // that used to force-close geminiWs immediately too, which defeated
+      // the whole point of the grace period above (this would win the race
+      // against turnComplete every time, before the session-resumption
+      // handle ever arrived). Give it the same short grace period instead.
+      downsampler.kill();
+      closeGeminiSoon(500);
+    } else {
+      // Client disconnected mid-turn (error/force-quit) — nothing useful
+      // left to wait for.
+      downsampler.kill();
+      try {
+        geminiWs?.close();
+      } catch {}
+    }
   });
 });
 
