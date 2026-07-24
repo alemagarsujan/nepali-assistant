@@ -1,0 +1,8 @@
+{
+  "name": "foreground-service",
+  "version": "1.0.0",
+  "description": "Local Expo module: keeps the app process alive in the background via an Android foreground service, so notification listening keeps working when the app isn't in the foreground.",
+  "main": "index.ts",
+  "license": "MIT",
+  "private": true
+}

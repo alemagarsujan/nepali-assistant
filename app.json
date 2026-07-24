@@ -21,7 +21,10 @@
         "READ_CONTACTS",
         "CALL_PHONE",
         "SCHEDULE_EXACT_ALARM",
-        "POST_NOTIFICATIONS"
+        "POST_NOTIFICATIONS",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_DATA_SYNC",
+        "WAKE_LOCK"
       ],
       "package": "com.sahayogi.assistant"
     },

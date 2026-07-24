@@ -1,5 +1,5 @@
 import Constants, { ExecutionEnvironment } from "expo-constants";
-import { Platform } from "react-native";
+import { PermissionsAndroid, Platform } from "react-native";
 import { createNativePcmPlayer, ensureNativeAudioInitialized } from "./voiceService";
 
 // Reads phone notifications aloud in Nepali, translating from English (or
@@ -42,6 +42,68 @@ function getListenerModule(): any {
     listenerModule = null;
   }
   return listenerModule;
+}
+
+// Without this, Android suspends the app's JS engine once it's not in the
+// foreground, so the "onNotificationReceived" listener below stops firing
+// (the notification still arrives at the OS level — it just doesn't get
+// processed until the app is reopened). Starting a foreground service
+// (a persistent low-priority notification) tells Android not to kill this
+// process, which keeps the JS side alive and listening in the background
+// too. Hand-copied local module (not an npm package) — see
+// modules/foreground-service/.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let foregroundServiceModule: any = undefined;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getForegroundService(): any {
+  if (!isNotificationListenerAvailable) return null;
+  if (foregroundServiceModule !== undefined) return foregroundServiceModule;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    foregroundServiceModule = require("../../modules/foreground-service").default;
+    console.log(`🔔 foreground service module loaded: ${foregroundServiceModule ? "ok" : "null"}`);
+  } catch (err) {
+    console.warn("🔔 foreground service module unavailable:", err);
+    foregroundServiceModule = null;
+  }
+  return foregroundServiceModule;
+}
+
+async function startForegroundKeepAlive(): Promise<void> {
+  const fg = getForegroundService();
+  if (!fg) return;
+  try {
+    // The foreground service's own persistent notification needs
+    // POST_NOTIFICATIONS on Android 13+, same as any other notification —
+    // the service itself still runs without it, just silently (per the
+    // library's own docs), so this is best-effort, not gating.
+    if (Platform.OS === "android" && Number(Platform.Version) >= 33) {
+      await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS).catch(() => {});
+    }
+    await fg.start({
+      id: 1001,
+      title: "सहयोगी",
+      message: "सूचना सुन्दैछ...",
+      ServiceType: "dataSync",
+      importance: "low",
+      visibility: "secret",
+      ongoing: true,
+    });
+    console.log("🔔 foreground keep-alive service started");
+  } catch (err) {
+    console.warn("🔔 foreground keep-alive service failed to start:", err);
+  }
+}
+
+async function stopForegroundKeepAlive(): Promise<void> {
+  const fg = getForegroundService();
+  if (!fg) return;
+  try {
+    await fg.stop();
+    console.log("🔔 foreground keep-alive service stopped");
+  } catch (err) {
+    console.warn("🔔 foreground keep-alive service failed to stop:", err);
+  }
 }
 
 export interface NotificationData {
@@ -286,12 +348,16 @@ export function startNotificationListener(): void {
     enqueueSpeak(() => speakNotification(n));
   });
   console.log("🔔 startNotificationListener: listener attached");
+
+  void startForegroundKeepAlive();
 }
 
 export function stopNotificationListener(): void {
   activeSubscription?.remove();
   activeSubscription = null;
   console.log("🔔 stopNotificationListener: stopped");
+
+  void stopForegroundKeepAlive();
 }
 
 export function isNotificationListenerRunning(): boolean {

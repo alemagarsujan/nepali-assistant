@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Define custom permission for secure broadcast -->
+    <permission
+        android:name="${applicationId}.permission.FOREGROUND_SERVICE_BROADCAST"
+        android:protectionLevel="signature" />
+
+    <uses-permission android:name="${applicationId}.permission.FOREGROUND_SERVICE_BROADCAST" />
+
+    <application>
+        <!--
+          notification_channel_name/description/color meta-data tags are
+          intentionally omitted — ForegroundServiceModule.kt falls back to
+          sane defaults ("Foreground Service Channel" / no tint) when they're
+          missing, and we pass title/message/icon explicitly from JS anyway
+          (see notificationService.ts), so no app-level manifest edit is
+          needed here.
+        -->
+        <service
+            android:name=".ForegroundTaskService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <service
+            android:name=".HeadlessTaskRunner"
+            android:enabled="true"
+            android:exported="false" />
+    </application>
+</manifest>
